@@ -1,0 +1,379 @@
+name: Build whisper.cpp release zips
+
+# Produces the five whisper.cpp build archives consumed by SubtitleEdit's
+# WhisperDownloadService (whisper-blas-bin-x64.zip, whisper-vulkan-x64.zip,
+# whisper-vulkan-linux64.zip, whisper-cuda-linux64.zip, whisper-mac.zip).
+#
+# Sourcing strategy:
+#   - Windows BLAS: repackage the upstream ggml-org/whisper.cpp release
+#     `whisper-blas-bin-x64.zip` (the only one of our five that upstream
+#     actually ships) plus our silero VAD model. No compile needed.
+#   - Windows Vulkan / Linux Vulkan / Linux CUDA / macOS Universal: build
+#     from upstream source at the requested ref, since upstream does not
+#     ship release artifacts for these targets.
+#
+# All archives carry the SubtitleEdit-specific ggml-silero-v6.2.0.bin model
+# alongside the binaries, matching the whispercpp-184 layout — except for
+# whisper-cuda-linux64.zip, which intentionally does NOT include the VAD
+# model (also matches the v184 manifest).
+#
+# Dispatch manually with workflow_dispatch. Defaults target v1.8.6; bump
+# `whisper_ref` / `release_tag` for future releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: 'whisper.cpp git ref (must match an upstream release tag for the Windows BLAS repack)'
+        required: true
+        default: 'v1.8.6'
+      release_tag:
+        description: 'Tag for the resulting support-files release'
+        required: true
+        default: 'whispercpp-186'
+      release_name:
+        description: 'Display name for the release'
+        required: true
+        default: 'Whisper CPP v1.8.6'
+      silero_url:
+        description: 'URL of ggml-silero-v6.2.0.zip (the VAD model bundled into 4 of the 5 archives)'
+        required: true
+        default: 'https://github.com/SubtitleEdit/support-files/releases/download/whispercpp-184/ggml-silero-v6.2.0.zip'
+
+jobs:
+  # --------------------------------------------------------------------
+  # Shared: fetch the VAD model once so each platform job can pull it as
+  # an artifact instead of re-downloading.
+  # --------------------------------------------------------------------
+  fetch-silero:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download silero VAD model
+        run: |
+          curl -fL -o ggml-silero-v6.2.0.zip "${{ inputs.silero_url }}"
+          unzip -o ggml-silero-v6.2.0.zip
+          test -f ggml-silero-v6.2.0.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silero
+          path: ggml-silero-v6.2.0.bin
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Windows BLAS x64 — repackage upstream zip + bundle the VAD model.
+  # No native build, so this runs on ubuntu-latest with zip/unzip.
+  # --------------------------------------------------------------------
+  windows-blas:
+    needs: fetch-silero
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download upstream whisper-blas-bin-x64.zip
+        run: |
+          curl -fL -o upstream.zip \
+            "https://github.com/ggml-org/whisper.cpp/releases/download/${{ inputs.whisper_ref }}/whisper-blas-bin-x64.zip"
+
+      - name: Extract and flatten
+        run: |
+          mkdir staging
+          unzip -j -o upstream.zip -d staging
+          # Drop anything we don't redistribute: PDBs, msbuild leftovers, tests.
+          rm -f staging/*.pdb staging/*.exp staging/*.ilk staging/*.lastbuildstate
+          # Strip helper executables we never invoke (keep only whisper-cli + libs).
+          find staging -maxdepth 1 -type f \( -name 'bench.exe' -o -name 'main.exe' -o -name 'quantize.exe' -o -name 'server.exe' -o -name 'stream.exe' -o -name 'command.exe' -o -name 'lsp.exe' -o -name 'talk-llama.exe' \) -delete || true
+          ls -la staging
+
+      - uses: actions/download-artifact@v4
+        with: { name: silero, path: staging }
+
+      - name: Pack whisper-blas-bin-x64.zip
+        run: |
+          cd staging && zip -r ../whisper-blas-bin-x64.zip . && cd ..
+          unzip -l whisper-blas-bin-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-blas-bin-x64
+          path: whisper-blas-bin-x64.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Windows Vulkan x64 — build from source with -DGGML_VULKAN=ON.
+  # --------------------------------------------------------------------
+  windows-vulkan:
+    needs: fetch-silero
+    runs-on: windows-latest
+    steps:
+      - name: Clone whisper.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_ref }}
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.3.296.0
+          install_runtime: false
+          cache: true
+          stripdown: false
+
+      - name: Install SPIRV-Headers
+        # jakoch's SDK install layout doesn't include SPIRV-HeadersConfig.cmake
+        # where CMake's find_package looks, so install the headers from source
+        # into a local prefix. Header-only library — installs in seconds.
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch vulkan-sdk-1.3.296.0 https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers
+          cd spirv-headers
+          cmake -B build -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/spirv-install"
+          cmake --build build --target install --config Release
+          # Sanity-check the CMake config file we'll be searching for.
+          Get-ChildItem -Recurse "$env:GITHUB_WORKSPACE/spirv-install" -Filter '*.cmake' | Select-Object FullName
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_VULKAN=ON `
+            -DWHISPER_SDL2=OFF `
+            -DBUILD_SHARED_LIBS=ON `
+            -DCMAKE_PREFIX_PATH="$env:VULKAN_SDK;$env:GITHUB_WORKSPACE/spirv-install"
+
+      - name: Build whisper-cli
+        shell: pwsh
+        run: cmake --build build --config Release --target whisper-cli -j
+
+      - name: Stage release bits
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path staging | Out-Null
+          # whisper-cli.exe + every ggml/whisper dll generated by the build
+          Get-ChildItem build/bin/Release -File | Where-Object {
+            $_.Extension -in '.exe','.dll'
+          } | Where-Object {
+            $_.Name -notin 'bench.exe','main.exe','quantize.exe','server.exe','stream.exe','command.exe','lsp.exe','talk-llama.exe'
+          } | Copy-Item -Destination staging
+
+      - uses: actions/download-artifact@v4
+        with: { name: silero, path: staging }
+
+      - name: Pack whisper-vulkan-x64.zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path staging/* -DestinationPath whisper-vulkan-x64.zip
+          Expand-Archive -Path whisper-vulkan-x64.zip -DestinationPath listing-only -Force
+          Get-ChildItem listing-only
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-x64
+          path: whisper-vulkan-x64.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Linux Vulkan x64 — build with -DGGML_VULKAN=ON -DGGML_CPU_ALL_VARIANTS=ON
+  # so we ship the per-microarch libggml-cpu-*.so set matching v184.
+  # --------------------------------------------------------------------
+  linux-vulkan:
+    needs: fetch-silero
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone whisper.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_ref }}
+
+      - name: Install Vulkan SDK + tools
+        # ubuntu-latest is now noble (24.04), so use the noble repo path —
+        # the jammy variant pulls libyaml-cpp0.7 which isn't in noble.
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk libvulkan-dev glslang-tools libsdl2-dev cmake
+
+      - name: Configure
+        # GGML_BACKEND_DL is required by GGML_CPU_ALL_VARIANTS — it switches
+        # to a dlopen plugin model so the per-microarch libggml-cpu-*.so
+        # variants can coexist in one install.
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DBUILD_SHARED_LIBS=ON
+
+      - name: Build whisper-cli
+        run: cmake --build build --config Release --target whisper-cli -j $(nproc)
+
+      - name: Stage release bits
+        run: |
+          mkdir staging
+          cp build/bin/whisper-cli staging/
+          cp build/bin/libggml*.so staging/ 2>/dev/null || cp build/lib/libggml*.so staging/
+          ls -la staging
+
+      - uses: actions/download-artifact@v4
+        with: { name: silero, path: staging }
+
+      - name: Pack whisper-vulkan-linux64.zip
+        run: |
+          cd staging && zip -r ../whisper-vulkan-linux64.zip . && cd ..
+          unzip -l whisper-vulkan-linux64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-linux64
+          path: whisper-vulkan-linux64.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Linux CUDA x64 — build with CUDA 12.4 toolkit and all CPU variants.
+  # NOTE: the v184 manifest does NOT include the silero bin in this zip;
+  # we match that exactly.
+  # --------------------------------------------------------------------
+  linux-cuda:
+    # Pin to 22.04 because Jimver/cuda-toolkit installs apt packages built
+    # against the runner's libc/libstdc++; on noble (24.04) the `cuda-12-4`
+    # meta package isn't published yet via the network method.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone whisper.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_ref }}
+
+      - name: Install CUDA toolkit 12.4
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.0'
+          method: network
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Configure
+        # GGML_BACKEND_DL is required by GGML_CPU_ALL_VARIANTS — see notes in
+        # the linux-vulkan Configure step.
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DBUILD_SHARED_LIBS=ON
+
+      - name: Build whisper-cli
+        run: cmake --build build --config Release --target whisper-cli -j $(nproc)
+
+      - name: Stage release bits (no silero in this zip per v184 layout)
+        run: |
+          mkdir staging
+          cp build/bin/whisper-cli staging/
+          cp build/bin/libggml*.so staging/ 2>/dev/null || cp build/lib/libggml*.so staging/
+          ls -la staging
+
+      - name: Pack whisper-cuda-linux64.zip
+        run: |
+          cd staging && zip -r ../whisper-cuda-linux64.zip . && cd ..
+          unzip -l whisper-cuda-linux64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cuda-linux64
+          path: whisper-cuda-linux64.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # macOS Universal — single fat binary built with both arm64 + x86_64,
+  # using Apple's Metal backend (Metal is implicit on macOS / iOS targets).
+  # Matches the v184 layout: just `whisper-cli` + the VAD model.
+  # --------------------------------------------------------------------
+  macos:
+    needs: fetch-silero
+    runs-on: macos-latest
+    steps:
+      - name: Clone whisper.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_ref }}
+
+      - name: Configure (Universal arm64+x86_64)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+
+      - name: Build whisper-cli
+        run: cmake --build build --config Release --target whisper-cli -j $(sysctl -n hw.logicalcpu)
+
+      - name: Verify universal
+        run: |
+          file build/bin/whisper-cli
+          lipo -info build/bin/whisper-cli
+
+      - name: Stage release bits
+        run: |
+          mkdir staging
+          cp build/bin/whisper-cli staging/
+          ls -la staging
+
+      - uses: actions/download-artifact@v4
+        with: { name: silero, path: staging }
+
+      - name: Pack whisper-mac.zip
+        run: |
+          cd staging && zip -r ../whisper-mac.zip . && cd ..
+          unzip -l whisper-mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-mac
+          path: whisper-mac.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Collect all five archives and publish them as a single release.
+  # The first run for a given tag creates the release; reruns update it.
+  # --------------------------------------------------------------------
+  release:
+    needs: [windows-blas, windows-vulkan, linux-vulkan, linux-cuda, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show staged archives
+        run: ls -la artifacts/*/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/whisper-blas-bin-x64/whisper-blas-bin-x64.zip
+            artifacts/whisper-vulkan-x64/whisper-vulkan-x64.zip
+            artifacts/whisper-vulkan-linux64/whisper-vulkan-linux64.zip
+            artifacts/whisper-cuda-linux64/whisper-cuda-linux64.zip
+            artifacts/whisper-mac/whisper-mac.zip
