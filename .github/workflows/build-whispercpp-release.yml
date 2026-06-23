@@ -17,7 +17,7 @@ name: Build whisper.cpp release zips
 # whisper-cuda-linux64.zip, which intentionally does NOT include the VAD
 # model (also matches the v184 manifest).
 #
-# Dispatch manually with workflow_dispatch. Defaults target v1.8.6; bump
+# Dispatch manually with workflow_dispatch. Defaults target v1.9.1; bump
 # `whisper_ref` / `release_tag` for future releases.
 
 on:
@@ -26,15 +26,15 @@ on:
       whisper_ref:
         description: 'whisper.cpp git ref (must match an upstream release tag for the Windows BLAS repack)'
         required: true
-        default: 'v1.8.6'
+        default: 'v1.9.1'
       release_tag:
         description: 'Tag for the resulting support-files release'
         required: true
-        default: 'whispercpp-186'
+        default: 'whispercpp-191'
       release_name:
         description: 'Display name for the release'
         required: true
-        default: 'Whisper CPP v1.8.6'
+        default: 'Whisper CPP v1.9.1'
       silero_url:
         description: 'URL of ggml-silero-v6.2.0.zip (the VAD model bundled into 4 of the 5 archives)'
         required: true
