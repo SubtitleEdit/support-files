@@ -1,0 +1,519 @@
+name: Build audio.cpp IndexTTS release archives
+
+# Produces the audio.cpp build archives that back SubtitleEdit's IndexTTS-2.5 TTS
+# engine. Upstream (0xShug0/audio.cpp, Apache-2.0) publishes Windows prebuilts only,
+# so every archive here is built from source at a pinned ref.
+#
+# These are *composite* builds: `--model-set custom --models index_tts2` compiles only
+# the IndexTTS2/2.5 family instead of all 44 model families, which keeps the CLI around
+# 7 MB and the server around 12 MB. `--deployment-build` compiles the package specs into
+# the binaries so a standalone GGUF loads without a model_specs directory next to it.
+#
+# Model weights are NOT shipped here. IndexTTS-2.5 GGUFs live on Hugging Face
+# (audio-cpp/audio.cpp-gguf) and are downloaded by SubtitleEdit at runtime. Those weights
+# are under the bilibili Model Use License, not Apache-2.0.
+#
+# Release CPU portability: every job passes native-cpu OFF. The build scripts default to
+# ON, which tunes for the runner's own CPU — fine locally, wrong for redistribution (an
+# M4-tuned arm64 binary can emit instructions an M1 lacks, and an AVX-512 runner build
+# dies on older x86-64).
+#
+# The CUDA jobs are off by default. They add roughly 1.5-2 h of build time for the
+# multi-architecture fat binary, and the Windows CUDA archive is ~700 MB once the cuBLAS
+# redistributables are bundled. Turn them on with the include_cuda input once the CPU,
+# Vulkan and Metal archives are known good.
+#
+# Dispatch manually with workflow_dispatch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      audiocpp_repo:
+        description: 'Source repository (switch to a SubtitleEdit fork here if we ever need to patch upstream)'
+        required: true
+        default: '0xShug0/audio.cpp'
+      audiocpp_ref:
+        description: 'audio.cpp git ref (tag, branch or commit SHA)'
+        required: true
+        default: '9a5eb8647efb0ad34d2f6110349253129f7a89c6'
+      release_tag:
+        description: 'Tag for the resulting support-files release'
+        required: true
+        default: 'audiocpp-indextts25-2026-08-16'
+      release_name:
+        description: 'Display name for the release'
+        required: true
+        default: 'audio.cpp IndexTTS-2.5 engine (2026-08-16)'
+      models:
+        description: 'Composite model families to compile in (comma separated)'
+        required: true
+        default: 'index_tts2'
+      include_cuda:
+        description: 'Also build the Windows and Linux CUDA archives (slow, large)'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  ARCHIVE_PREFIX: audiocpp-indextts25
+
+jobs:
+  # --------------------------------------------------------------------
+  # macOS arm64 (Metal). The Metal shader library is embedded in the
+  # binary by build_metal.sh, so there is no .metallib to ship alongside.
+  # --------------------------------------------------------------------
+  macos-metal:
+    name: macOS arm64 Metal
+    runs-on: macos-14
+    steps:
+      - name: Clone audio.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.audiocpp_repo }}
+          ref: ${{ inputs.audiocpp_ref }}
+
+      - name: Build CLI and server
+        run: |
+          scripts/build_metal.sh \
+            --build-type Release \
+            --archs arm64 \
+            --native-cpu OFF \
+            --deployment-build \
+            --model-set custom \
+            --models "${{ inputs.models }}" \
+            --target audiocpp_cli \
+            --target audiocpp_server
+
+      - name: Smoke test
+        run: |
+          build/macos-metal-release/bin/audiocpp_cli --list-devices
+          build/macos-metal-release/bin/audiocpp_cli --help > /dev/null
+
+      - name: Stage archive
+        run: |
+          mkdir -p staging
+          cp build/macos-metal-release/bin/audiocpp_cli staging/
+          cp build/macos-metal-release/bin/audiocpp_server staging/
+          cp LICENSE staging/LICENSE
+          cat > staging/BUILD-INFO.txt <<EOF
+          audio.cpp build for SubtitleEdit's IndexTTS-2.5 engine
+          source      : https://github.com/${{ inputs.audiocpp_repo }}
+          ref         : ${{ inputs.audiocpp_ref }}
+          models      : ${{ inputs.models }}
+          backend     : metal (arm64)
+          native cpu  : OFF
+          built       : $(date -u +%Y-%m-%dT%H:%M:%SZ) by ${{ github.workflow }}
+          license     : Apache-2.0, see LICENSE
+          model weights are NOT included; they are downloaded from Hugging Face at runtime
+          and carry the separate bilibili Model Use License.
+          EOF
+          ls -la staging
+
+      - name: Pack
+        run: tar -czf "${ARCHIVE_PREFIX}-macos-arm64.tar.gz" -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: ${{ env.ARCHIVE_PREFIX }}-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Windows x86_64, CPU and Vulkan.
+  # --------------------------------------------------------------------
+  windows:
+    name: Windows x86_64 ${{ matrix.backend }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            preset: windows-cpu-release
+          - backend: vulkan
+            preset: windows-vulkan-release
+    steps:
+      - name: Clone audio.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.audiocpp_repo }}
+          ref: ${{ inputs.audiocpp_ref }}
+
+      # stripdown:false keeps SPIRV-Headers in the SDK; ggml's Vulkan backend does a
+      # find_package(SPIRV-Headers CONFIG REQUIRED) and a stripped install fails there.
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.3.296.0
+          install_runtime: false
+          cache: true
+          stripdown: false
+
+      - name: Build CLI
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 `
+            -Preset ${{ matrix.preset }} `
+            -NativeCpu OFF `
+            -DeploymentBuild `
+            -ModelSet custom `
+            -Models "${{ inputs.models }}" `
+            -Target audiocpp_cli
+
+      - name: Build server
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 `
+            -Preset ${{ matrix.preset }} `
+            -NativeCpu OFF `
+            -DeploymentBuild `
+            -ModelSet custom `
+            -Models "${{ inputs.models }}" `
+            -Target audiocpp_server
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          .\build\${{ matrix.preset }}\bin\audiocpp_cli.exe --list-devices
+
+      - name: Stage archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item ".\build\${{ matrix.preset }}\bin\audiocpp_cli.exe" staging\
+          Copy-Item ".\build\${{ matrix.preset }}\bin\audiocpp_server.exe" staging\
+          # Any runtime DLLs the build produced (ggml backends, vulkan glue).
+          Get-ChildItem ".\build\${{ matrix.preset }}\bin\*.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName staging\ }
+          Copy-Item LICENSE staging\LICENSE
+          $info = @(
+            "audio.cpp build for SubtitleEdit's IndexTTS-2.5 engine"
+            "source      : https://github.com/${{ inputs.audiocpp_repo }}"
+            "ref         : ${{ inputs.audiocpp_ref }}"
+            "models      : ${{ inputs.models }}"
+            "backend     : ${{ matrix.backend }} (x86_64)"
+            "native cpu  : OFF"
+            "built       : $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) by ${{ github.workflow }}"
+            "license     : Apache-2.0, see LICENSE"
+            "model weights are NOT included; they are downloaded from Hugging Face at runtime"
+            "and carry the separate bilibili Model Use License."
+          )
+          $info | Set-Content staging\BUILD-INFO.txt
+          Get-ChildItem staging
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          Compress-Archive -Path staging\* -DestinationPath "$env:ARCHIVE_PREFIX-windows-x86_64-${{ matrix.backend }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-${{ matrix.backend }}
+          path: ${{ env.ARCHIVE_PREFIX }}-windows-x86_64-${{ matrix.backend }}.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Windows x86_64 CUDA. Opt-in.
+  #
+  # The explicit architecture list matters twice over: the build scripts otherwise
+  # configure for the runner's own GPU (there is none), and a list that starts at 75
+  # leaves Pascal and Volta cards dead at the first kernel launch — they cannot JIT
+  # 7.5 PTX. 120-real needs CUDA 12.8+, hence the 12.9 pin.
+  # --------------------------------------------------------------------
+  windows-cuda:
+    name: Windows x86_64 CUDA
+    runs-on: windows-2022
+    if: ${{ inputs.include_cuda }}
+    steps:
+      - name: Clone audio.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.audiocpp_repo }}
+          ref: ${{ inputs.audiocpp_ref }}
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        id: cuda-toolkit
+        with:
+          cuda: '12.9.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Build CLI
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 `
+            -Preset windows-cuda-release `
+            -CudaArchitectures "61-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real" `
+            -NativeCpu OFF `
+            -DeploymentBuild `
+            -ModelSet custom `
+            -Models "${{ inputs.models }}" `
+            -Target audiocpp_cli
+
+      - name: Build server
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 `
+            -Preset windows-cuda-release `
+            -CudaArchitectures "61-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real" `
+            -NativeCpu OFF `
+            -DeploymentBuild `
+            -ModelSet custom `
+            -Models "${{ inputs.models }}" `
+            -Target audiocpp_server
+
+      - name: Stage archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item ".\build\windows-cuda-release\bin\audiocpp_cli.exe" staging\
+          Copy-Item ".\build\windows-cuda-release\bin\audiocpp_server.exe" staging\
+          Get-ChildItem ".\build\windows-cuda-release\bin\*.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName staging\ }
+
+          # CMake leaves the CUDA runtime in the toolkit directory, so a "copy whatever the
+          # build produced" glob ships an archive that dies in the loader with 0xC0000135.
+          # Same packaging bug that shipped in every omnivoice CUDA zip up to 2026-08-03.
+          $cudaBin = Join-Path "$env:CUDA_PATH" "bin"
+          $needed = @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")
+          foreach ($pattern in $needed) {
+            $found = Get-ChildItem (Join-Path $cudaBin $pattern) -ErrorAction SilentlyContinue
+            if (-not $found) { throw "CUDA redistributable not found: $pattern in $cudaBin" }
+            $found | ForEach-Object { Copy-Item $_.FullName staging\ }
+          }
+
+          Copy-Item LICENSE staging\LICENSE
+          $info = @(
+            "audio.cpp build for SubtitleEdit's IndexTTS-2.5 engine"
+            "source      : https://github.com/${{ inputs.audiocpp_repo }}"
+            "ref         : ${{ inputs.audiocpp_ref }}"
+            "models      : ${{ inputs.models }}"
+            "backend     : cuda 12.9 (x86_64), sm 61/70/75/80/86/89/90/120"
+            "native cpu  : OFF"
+            "built       : $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) by ${{ github.workflow }}"
+            "license     : Apache-2.0, see LICENSE"
+            "model weights are NOT included; they are downloaded from Hugging Face at runtime"
+            "and carry the separate bilibili Model Use License."
+          )
+          $info | Set-Content staging\BUILD-INFO.txt
+          Get-ChildItem staging
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          Compress-Archive -Path staging\* -DestinationPath "$env:ARCHIVE_PREFIX-windows-x86_64-cuda.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-cuda
+          path: ${{ env.ARCHIVE_PREFIX }}-windows-x86_64-cuda.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Linux x86_64, CPU and Vulkan.
+  # --------------------------------------------------------------------
+  linux:
+    name: Linux x86_64 ${{ matrix.backend }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, vulkan]
+    env:
+      CC: gcc-13
+      CXX: g++-13
+    steps:
+      - name: Clone audio.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.audiocpp_repo }}
+          ref: ${{ inputs.audiocpp_ref }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 cmake make
+          if [ "${{ matrix.backend }}" = "vulkan" ]; then
+            sudo apt-get install -y glslc libvulkan-dev spirv-headers
+          fi
+
+      - name: Build CLI and server
+        run: |
+          scripts/build_linux.sh \
+            --backend ${{ matrix.backend }} \
+            --native-cpu OFF \
+            --deployment-build \
+            --model-set custom \
+            --models "${{ inputs.models }}" \
+            --target audiocpp_cli \
+            --target audiocpp_server
+
+      - name: Smoke test
+        run: |
+          build/linux-${{ matrix.backend }}-release/bin/audiocpp_cli --list-devices
+
+      - name: Stage archive
+        run: |
+          mkdir -p staging
+          cp build/linux-${{ matrix.backend }}-release/bin/audiocpp_cli staging/
+          cp build/linux-${{ matrix.backend }}-release/bin/audiocpp_server staging/
+          cp LICENSE staging/LICENSE
+          cat > staging/BUILD-INFO.txt <<EOF
+          audio.cpp build for SubtitleEdit's IndexTTS-2.5 engine
+          source      : https://github.com/${{ inputs.audiocpp_repo }}
+          ref         : ${{ inputs.audiocpp_ref }}
+          models      : ${{ inputs.models }}
+          backend     : ${{ matrix.backend }} (x86_64)
+          native cpu  : OFF
+          built       : $(date -u +%Y-%m-%dT%H:%M:%SZ) by ${{ github.workflow }}
+          license     : Apache-2.0, see LICENSE
+          model weights are NOT included; they are downloaded from Hugging Face at runtime
+          and carry the separate bilibili Model Use License.
+          EOF
+          ls -la staging
+
+      - name: Pack
+        run: |
+          if [ "${{ matrix.backend }}" = "cpu" ]; then
+            name="${ARCHIVE_PREFIX}-linux-x86_64.tar.gz"
+          else
+            name="${ARCHIVE_PREFIX}-linux-x86_64-${{ matrix.backend }}.tar.gz"
+          fi
+          tar -czf "$name" -C staging .
+          echo "ARCHIVE_NAME=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-${{ matrix.backend }}
+          path: ${{ env.ARCHIVE_NAME }}
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Linux x86_64 CUDA. Opt-in, same architecture reasoning as Windows.
+  # --------------------------------------------------------------------
+  linux-cuda:
+    name: Linux x86_64 CUDA
+    runs-on: ubuntu-24.04
+    if: ${{ inputs.include_cuda }}
+    env:
+      CC: gcc-13
+      CXX: g++-13
+    steps:
+      - name: Clone audio.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.audiocpp_repo }}
+          ref: ${{ inputs.audiocpp_ref }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 cmake make
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.9.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev", "thrust"]'
+          non-cuda-sub-packages: '[]'
+
+      - name: Build CLI and server
+        run: |
+          scripts/build_linux.sh \
+            --backend cuda \
+            --cuda-arch "61-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real" \
+            --native-cpu OFF \
+            --deployment-build \
+            --model-set custom \
+            --models "${{ inputs.models }}" \
+            --target audiocpp_cli \
+            --target audiocpp_server
+
+      - name: Stage archive
+        run: |
+          mkdir -p staging
+          cp build/linux-cuda-release/bin/audiocpp_cli staging/
+          cp build/linux-cuda-release/bin/audiocpp_server staging/
+          cp LICENSE staging/LICENSE
+          cat > staging/BUILD-INFO.txt <<EOF
+          audio.cpp build for SubtitleEdit's IndexTTS-2.5 engine
+          source      : https://github.com/${{ inputs.audiocpp_repo }}
+          ref         : ${{ inputs.audiocpp_ref }}
+          models      : ${{ inputs.models }}
+          backend     : cuda 12.9 (x86_64), sm 61/70/75/80/86/89/90/120
+          native cpu  : OFF
+          built       : $(date -u +%Y-%m-%dT%H:%M:%SZ) by ${{ github.workflow }}
+          license     : Apache-2.0, see LICENSE
+          model weights are NOT included; they are downloaded from Hugging Face at runtime
+          and carry the separate bilibili Model Use License.
+          EOF
+          ls -la staging
+
+      - name: Pack
+        run: tar -czf "${ARCHIVE_PREFIX}-linux-x86_64-cuda.tar.gz" -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-cuda
+          path: ${{ env.ARCHIVE_PREFIX }}-linux-x86_64-cuda.tar.gz
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Collect every archive, publish the release, and print the SHA-256 list
+  # that has to be prepended to DownloadHashManager on the SubtitleEdit side
+  # (without those entries existing installs never see the update).
+  # --------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [macos-metal, windows, linux]
+    if: ${{ always() && needs.macos-metal.result == 'success' && needs.windows.result == 'success' && needs.linux.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect archives
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} release/ \;
+          cd release
+          sha256sum * | tee SHA256SUMS.txt
+          ls -la
+
+      - name: Job summary
+        run: |
+          {
+            echo "### audio.cpp IndexTTS-2.5 archives"
+            echo
+            echo "source: \`${{ inputs.audiocpp_repo }}\` @ \`${{ inputs.audiocpp_ref }}\`"
+            echo
+            echo '| archive | bytes | sha256 |'
+            echo '|---|---:|---|'
+            cd release
+            for f in *; do
+              [ "$f" = "SHA256SUMS.txt" ] && continue
+              echo "| $f | $(stat -c%s "$f") | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.release_name }}" \
+            --notes "audio.cpp composite build (\`${{ inputs.models }}\`) for SubtitleEdit's IndexTTS-2.5 engine.
+
+          Source: [${{ inputs.audiocpp_repo }}](https://github.com/${{ inputs.audiocpp_repo }}) @ \`${{ inputs.audiocpp_ref }}\`, Apache-2.0.
+          Binaries only — IndexTTS-2.5 weights are downloaded from Hugging Face at runtime and carry the separate bilibili Model Use License.
+
+          See SHA256SUMS.txt for the hashes to add to DownloadHashManager." \
+            release/*
