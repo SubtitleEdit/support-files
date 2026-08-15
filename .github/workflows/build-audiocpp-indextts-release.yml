@@ -175,10 +175,20 @@ jobs:
             -Models "${{ inputs.models }}" `
             -Target audiocpp_server
 
+      # A hosted runner has no GPU, and for the Vulkan preset no ICD or loader from a
+      # driver either, so a device probe there says nothing about the artifact — it only
+      # says the runner is headless. Gate on the binary starting and printing help; run
+      # the device probe for the log and report its exit code without failing on it.
       - name: Smoke test
         shell: pwsh
         run: |
-          .\build\${{ matrix.preset }}\bin\audiocpp_cli.exe --list-devices
+          $exe = ".\build\${{ matrix.preset }}\bin\audiocpp_cli.exe"
+          if (-not (Test-Path $exe)) { throw "CLI was not produced at $exe" }
+          & $exe --help > $null
+          if ($LASTEXITCODE -ne 0) { throw "audiocpp_cli --help failed with exit code $LASTEXITCODE" }
+          Write-Host "vulkan-1.dll on runner: $(Test-Path "$env:SystemRoot\System32\vulkan-1.dll")"
+          & $exe --list-devices
+          Write-Host "--list-devices exit code: $LASTEXITCODE (informational)"
 
       - name: Stage archive
         shell: pwsh
@@ -353,9 +363,13 @@ jobs:
             --target audiocpp_cli \
             --target audiocpp_server
 
+      # Same reasoning as the Windows job: --help is the gate, the device probe is a log line.
       - name: Smoke test
         run: |
-          build/linux-${{ matrix.backend }}-release/bin/audiocpp_cli --list-devices
+          exe="build/linux-${{ matrix.backend }}-release/bin/audiocpp_cli"
+          test -x "$exe" || { echo "CLI was not produced at $exe"; exit 1; }
+          "$exe" --help > /dev/null
+          "$exe" --list-devices || echo "--list-devices exit code: $? (informational)"
 
       - name: Stage archive
         run: |
