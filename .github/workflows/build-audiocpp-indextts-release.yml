@@ -528,8 +528,17 @@ jobs:
   # --------------------------------------------------------------------
   release:
     name: Publish release
-    needs: [macos-metal, windows, linux]
-    if: ${{ always() && needs.macos-metal.result == 'success' && needs.windows.result == 'success' && needs.linux.result == 'success' }}
+    # The CUDA jobs are in needs even though they are opt-in: without them the release
+    # publishes as soon as the cheap jobs finish, and the CUDA archives — which take another
+    # 1.5-2 h — land in the run's artifacts with no release left to attach them to. Skipped
+    # counts as success here so an include_cuda=false run still publishes.
+    needs: [macos-metal, windows, linux, windows-cuda, linux-cuda]
+    if: ${{ always()
+      && needs.macos-metal.result == 'success'
+      && needs.windows.result == 'success'
+      && needs.linux.result == 'success'
+      && (needs.windows-cuda.result == 'success' || needs.windows-cuda.result == 'skipped')
+      && (needs.linux-cuda.result == 'success' || needs.linux-cuda.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
