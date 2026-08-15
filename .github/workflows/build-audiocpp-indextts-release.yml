@@ -394,11 +394,19 @@ jobs:
           "$exe" --help > /dev/null
           "$exe" --list-devices || echo "--list-devices exit code: $? (informational)"
 
+      # GCC leaves the symbol table and debug info in, which made the first release's Linux
+      # archives about 10x the Windows ones. Strip the staged copies, never the build tree.
       - name: Stage archive
         run: |
           mkdir -p staging
           cp build/linux-${{ matrix.backend }}-release/bin/audiocpp_cli staging/
           cp build/linux-${{ matrix.backend }}-release/bin/audiocpp_server staging/
+          for f in staging/audiocpp_cli staging/audiocpp_server; do
+            before=$(stat -c%s "$f")
+            strip --strip-all "$f"
+            echo "stripped $f: $before -> $(stat -c%s "$f") bytes"
+          done
+          staging/audiocpp_cli --help > /dev/null || { echo "stripped CLI no longer runs"; exit 1; }
           cp LICENSE staging/LICENSE
           cat > staging/BUILD-INFO.txt <<EOF
           audio.cpp build for SubtitleEdit's IndexTTS-2.5 engine
@@ -477,6 +485,11 @@ jobs:
           mkdir -p staging
           cp build/linux-cuda-release/bin/audiocpp_cli staging/
           cp build/linux-cuda-release/bin/audiocpp_server staging/
+          for f in staging/audiocpp_cli staging/audiocpp_server; do
+            before=$(stat -c%s "$f")
+            strip --strip-all "$f"
+            echo "stripped $f: $before -> $(stat -c%s "$f") bytes"
+          done
           cp LICENSE staging/LICENSE
           cat > staging/BUILD-INFO.txt <<EOF
           audio.cpp build for SubtitleEdit's IndexTTS-2.5 engine
