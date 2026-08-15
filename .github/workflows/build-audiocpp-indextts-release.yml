@@ -144,12 +144,18 @@ jobs:
 
       # stripdown:false keeps SPIRV-Headers in the SDK; ggml's Vulkan backend does a
       # find_package(SPIRV-Headers CONFIG REQUIRED) and a stripped install fails there.
+      #
+      # install_runtime:true is needed for the smoke test, not for the build: the Vulkan
+      # binary imports vulkan-1.dll at load time, so on a runner without the loader it dies
+      # with 0xC0000135 before main() — it cannot even print --help. End users get that DLL
+      # from their GPU driver, but a machine with no Vulkan driver hits the same crash, so
+      # SubtitleEdit must fall back to the CPU archive when the Vulkan binary fails to start.
       - name: Install Vulkan SDK
         if: matrix.backend == 'vulkan'
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
           vulkan_version: 1.3.296.0
-          install_runtime: false
+          install_runtime: true
           cache: true
           stripdown: false
 
@@ -211,6 +217,7 @@ jobs:
             "license     : Apache-2.0, see LICENSE"
             "model weights are NOT included; they are downloaded from Hugging Face at runtime"
             "and carry the separate bilibili Model Use License."
+            "${{ matrix.backend == 'vulkan' && 'NOTE: needs vulkan-1.dll from a Vulkan-capable GPU driver; without it the binary fails to start with 0xC0000135.' || '' }}"
           )
           $info | Set-Content staging\BUILD-INFO.txt
           Get-ChildItem staging
