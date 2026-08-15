@@ -277,7 +277,7 @@ jobs:
         with:
           cuda: '12.9.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "thrust", "visual_studio_integration"]'
 
       - name: Build CLI
         shell: pwsh
@@ -473,7 +473,7 @@ jobs:
           cuda: '12.9.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart-dev", "thrust"]'
-          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev", "libcufft", "libcufft-dev"]'
 
       - name: Build CLI and server
         run: |
