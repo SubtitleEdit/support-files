@@ -17,6 +17,18 @@ name: Build whisper.cpp release zips
 # whisper-cuda-linux64.zip, which intentionally does NOT include the VAD
 # model (also matches the v184 manifest).
 #
+# Linux packaging (see SubtitleEdit issue #13680): the two Linux jobs build
+# with BUILD_SHARED_LIBS=ON, so whisper-cli is only half the payload — it
+# links against libwhisper.so.1 and libggml.so.0 at runtime. Those must be
+# staged under the SONAME the loader asks for, as REAL files rather than the
+# symlink chain cmake leaves in build/bin, because Subtitle Edit unpacks
+# these archives with .NET's ZipArchive, which writes a symlink entry out as
+# an ordinary file containing the target path. Every ELF also gets its RPATH
+# rewritten to $ORIGIN so the loader looks next to the binary; the build-dir
+# RUNPATH cmake bakes in is meaningless on a user's machine. The `Verify`
+# step is the regression guard — whispercpp-184/186/191 all shipped Linux
+# archives with no libwhisper.so at all and nothing caught it.
+#
 # Dispatch manually with workflow_dispatch. Defaults target v1.9.1; bump
 # `whisper_ref` / `release_tag` for future releases.
 
@@ -30,11 +42,11 @@ on:
       release_tag:
         description: 'Tag for the resulting support-files release'
         required: true
-        default: 'whispercpp-191'
+        default: 'whispercpp-191-r2'
       release_name:
         description: 'Display name for the release'
         required: true
-        default: 'Whisper CPP v1.9.1'
+        default: 'Whisper CPP v1.9.1 (r2 - Linux shared library fix)'
       silero_url:
         description: 'URL of ggml-silero-v6.2.0.zip (the VAD model bundled into 4 of the 5 archives)'
         required: true
@@ -186,6 +198,14 @@ jobs:
           repository: ggml-org/whisper.cpp
           ref: ${{ inputs.whisper_ref }}
 
+      # Second, into a subfolder, for the shared Linux staging/verify scripts.
+      # Must come after the whisper.cpp checkout — that one owns the workspace
+      # root and cleans it.
+      - name: Check out support-files scripts
+        uses: actions/checkout@v5
+        with:
+          path: .se-support
+
       - name: Install Vulkan SDK + tools
         # ubuntu-latest is now noble (24.04), so use the noble repo path —
         # the jammy variant pulls libyaml-cpp0.7 which isn't in noble.
@@ -194,7 +214,7 @@ jobs:
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
             https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
           sudo apt-get update
-          sudo apt-get install -y vulkan-sdk libvulkan-dev glslang-tools libsdl2-dev cmake
+          sudo apt-get install -y vulkan-sdk libvulkan-dev glslang-tools libsdl2-dev cmake patchelf binutils
 
       - name: Configure
         # GGML_BACKEND_DL is required by GGML_CPU_ALL_VARIANTS — it switches
@@ -214,11 +234,10 @@ jobs:
         run: cmake --build build --config Release --target whisper-cli -j $(nproc)
 
       - name: Stage release bits
-        run: |
-          mkdir staging
-          cp build/bin/whisper-cli staging/
-          cp build/bin/libggml*.so staging/ 2>/dev/null || cp build/lib/libggml*.so staging/
-          ls -la staging
+        run: bash .se-support/.github/scripts/stage-linux-whisper.sh
+
+      - name: Verify bundled libraries resolve
+        run: bash .se-support/.github/scripts/verify-linux-whisper.sh
 
       - uses: actions/download-artifact@v4
         with: { name: silero, path: staging }
@@ -251,6 +270,12 @@ jobs:
           repository: ggml-org/whisper.cpp
           ref: ${{ inputs.whisper_ref }}
 
+      # See the note in linux-vulkan: must follow the whisper.cpp checkout.
+      - name: Check out support-files scripts
+        uses: actions/checkout@v5
+        with:
+          path: .se-support
+
       - name: Install CUDA toolkit 12.4
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
@@ -258,7 +283,7 @@ jobs:
           method: network
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential patchelf binutils
 
       - name: Configure
         # GGML_BACKEND_DL is required by GGML_CPU_ALL_VARIANTS — see notes in
@@ -277,11 +302,10 @@ jobs:
         run: cmake --build build --config Release --target whisper-cli -j $(nproc)
 
       - name: Stage release bits (no silero in this zip per v184 layout)
-        run: |
-          mkdir staging
-          cp build/bin/whisper-cli staging/
-          cp build/bin/libggml*.so staging/ 2>/dev/null || cp build/lib/libggml*.so staging/
-          ls -la staging
+        run: bash .se-support/.github/scripts/stage-linux-whisper.sh
+
+      - name: Verify bundled libraries resolve
+        run: bash .se-support/.github/scripts/verify-linux-whisper.sh
 
       - name: Pack whisper-cuda-linux64.zip
         run: |
