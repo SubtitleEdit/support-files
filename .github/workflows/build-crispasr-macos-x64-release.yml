@@ -1,0 +1,220 @@
+name: Build CrispASR macOS Intel (x86_64)
+
+# Produces `crispasr-macos-x86_64.tar.gz` - the Intel-Mac counterpart of
+# upstream's `crispasr-macos.tar.gz`, which has been arm64-only since the very
+# first CrispASR release (SubtitleEdit issue #13559: `Bad CPU type in
+# executable` / ggml-metal crashes on an Intel MacBook Pro).
+#
+# Upstream builds on `macos-latest`, which is Apple Silicon since macos-13 was
+# retired, and sets neither CMAKE_OSX_ARCHITECTURES nor a lipo step - so the
+# artifact is simply whatever the runner is. Rosetta cannot paper over it: it
+# translates x86_64 -> arm64, never the other way. Until upstream ships an
+# x86_64 (or universal) macOS build, SubtitleEdit builds one here and points
+# CrispAsrDownloadService at it for Intel Macs.
+#
+# The build cross-compiles on the arm64 runner (`-DCMAKE_OSX_ARCHITECTURES=x86_64`)
+# and differs from upstream's macOS recipe in four ways:
+#
+#   1. -DGGML_METAL=OFF. ggml's Metal kernels target Apple-family GPUs; on the
+#      AMD/Intel GPUs in Intel Macs they crash inside the Metal backend, which
+#      is exactly the failure #13559 reported when forcing emulation. The x86_64
+#      slice is a CPU build with Accelerate BLAS instead.
+#   2. -DGGML_NATIVE=OFF. Native tuning would emit the runner's -mcpu=apple-mN
+#      flags into an x86_64 compile (upstream hit the same in CrispASR#269).
+#      With it off, ggml picks its portable x86 baseline: SSE4.2 + AVX + AVX2 +
+#      FMA + F16C + BMI2, i.e. Haswell and later - every Intel Mac that can run
+#      macOS 12 is Haswell or newer.
+#   3. CMAKE_OSX_DEPLOYMENT_TARGET is pinned. Left unset, clang targets the
+#      runner's own macOS version and dyld then refuses to launch the binary on
+#      anything older - which would be every Intel Mac, since Intel support
+#      ended at macOS 15.
+#   4. The c2pa prebuilt is fetched here rather than by -DCRISPASR_C2PA_FETCH=ON.
+#      That option derives the target triple from CMAKE_SYSTEM_PROCESSOR, which
+#      on a cross-arch Apple build is still the *host* (arm64), so it would drop
+#      an aarch64 libc2pa_c.dylib into an x86_64 build. Fetching the
+#      x86_64-apple-darwin zip up front makes CrispasrC2pa.cmake skip its own
+#      download (it no-ops once third_party/c2pa/include/c2pa.h exists).
+#
+# The archive's inner folder is `crispasr-macos`, same as upstream's, so
+# SubtitleEdit's unpack path (DownloadSpeechToTextEngineViewModel's
+# "crispasr-macos" skip folder) needs no arch-specific special case.
+
+on:
+  workflow_dispatch:
+    inputs:
+      crispasr_ref:
+        description: 'CrispASR git ref to build (keep in sync with the version pinned in CrispAsrDownloadService)'
+        required: true
+        default: 'v0.8.29'
+      release_tag:
+        description: 'Tag for the resulting support-files release'
+        required: true
+        default: 'crispasr-0829-macos-x64'
+      release_name:
+        description: 'Display name for the release'
+        required: true
+        default: 'CrispASR v0.8.29 - macOS Intel (x86_64)'
+      c2pa_version:
+        description: 'c2pa-rs prebuilt version (must match CRISPASR_C2PA_VERSION in cmake/CrispasrC2pa.cmake)'
+        required: true
+        default: '0.89.3'
+      deployment_target:
+        description: 'Minimum macOS version the binaries will run on'
+        required: true
+        default: '12.0'
+
+jobs:
+  macos-x64:
+    runs-on: macos-latest # arm64; the x86_64 slice is cross-compiled
+    steps:
+      - name: Clone CrispASR
+        uses: actions/checkout@v5
+        with:
+          repository: CrispStrobe/CrispASR
+          ref: ${{ inputs.crispasr_ref }}
+          submodules: recursive
+
+      - name: Fetch c2pa prebuilt (x86_64-apple-darwin)
+        run: |
+          set -euo pipefail
+          ASSET="c2pa-v${{ inputs.c2pa_version }}-x86_64-apple-darwin.zip"
+          curl -fL -o c2pa.zip \
+            "https://github.com/contentauth/c2pa-rs/releases/download/c2pa-v${{ inputs.c2pa_version }}/${ASSET}"
+          mkdir -p third_party/c2pa
+          unzip -oq c2pa.zip -d third_party/c2pa
+          test -f third_party/c2pa/include/c2pa.h
+          # Guard against a same-named asset that is secretly the host arch -
+          # an arm64 sidecar here would link fine and then fail to load on the
+          # Intel Mac the whole build exists for.
+          lipo -info third_party/c2pa/lib/libc2pa_c.dylib
+          if ! lipo -info third_party/c2pa/lib/libc2pa_c.dylib | grep -q 'x86_64'; then
+            echo "c2pa prebuilt is not x86_64"; exit 1
+          fi
+
+      - name: Configure (x86_64, CPU + Accelerate)
+        # The empty PKG_CONFIG_* and CMAKE_IGNORE_PREFIX_PATH keep Homebrew out
+        # of the search path. Everything under /opt/homebrew on this runner is
+        # arm64, so an optional dependency found there (libmp3lame, libopus, ...)
+        # links into the x86_64 build and only surfaces as "ignoring file ...
+        # found architecture 'arm64'" plus undefined symbols at the very last
+        # link step, ~20 minutes in. Upstream's arm64 tarball links nothing
+        # outside /System and /usr/lib either, so this is parity, not a downgrade
+        # - .opus input still comes from the static FetchContent build below, and
+        # MP3 output falls back to the built-in glint encoder.
+        env:
+          PKG_CONFIG_LIBDIR: ''
+          PKG_CONFIG_PATH: ''
+        run: |
+          set -euo pipefail
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ inputs.deployment_target }} \
+            -DGGML_METAL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BLAS=ON \
+            -DGGML_BLAS_VENDOR=Apple \
+            -DCRISPASR_OPUS_FETCH=ON \
+            "-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local;/opt/local" \
+            2>&1 | tee configure.log
+
+      - name: Show what got enabled
+        run: |
+          grep -E 'GGML_SYSTEM_ARCH|CPU backend variant|C2PA signing|BLAS found|MP3 output|Opus' configure.log || true
+          # x86 baseline is the load-bearing line: it must say GGML_SYSTEM_ARCH: x86
+          grep -q 'GGML_SYSTEM_ARCH: x86' configure.log
+
+      - name: Build
+        run: cmake --build build --config Release --target crispasr-cli crispasr-quantize -j $(sysctl -n hw.logicalcpu)
+
+      - name: Stage release bits
+        run: |
+          set -euo pipefail
+          mkdir -p release/crispasr-macos
+          cp build/bin/crispasr release/crispasr-macos/
+          cp build/bin/crispasr-quantize release/crispasr-macos/
+          bash scripts/bundle-c2pa.sh release/crispasr-macos
+          # Same licence files upstream ships next to the macOS binaries; the
+          # bundled third-party libraries require the notice to travel along.
+          cp LICENSE release/crispasr-macos/
+          cp THIRD_PARTY_NOTICES.txt release/crispasr-macos/
+          ls -la release/crispasr-macos
+
+      - name: Verify (x86_64 only, no arm64 slice, correct min OS)
+        run: |
+          set -euo pipefail
+          for f in crispasr crispasr-quantize libc2pa_c.dylib; do
+            path="release/crispasr-macos/$f"
+            test -f "$path" || { echo "MISSING: $f"; exit 1; }
+            echo "--- $f"
+            file "$path"
+            lipo -info "$path"
+            if ! lipo -info "$path" | grep -q 'x86_64'; then
+              echo "$f is not x86_64"; exit 1
+            fi
+            if lipo -info "$path" | grep -q 'arm64'; then
+              echo "$f still contains an arm64 slice"; exit 1
+            fi
+            # dyld refuses to launch a binary whose LC_BUILD_VERSION minos is
+            # newer than the machine - the exact way a runner-defaulted target
+            # would silently break every Intel Mac. (Upstream's arm64 tarball
+            # shows what that looks like: v0.8.29's crispasr is stamped
+            # minos 26.0, i.e. the runner's own macOS.) The c2pa sidecar is a
+            # third-party prebuilt with its own target, so only our two
+            # binaries are held to the requested value.
+            minos=$(otool -l "$path" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+            echo "minos=$minos"
+            if [ "$f" != "libc2pa_c.dylib" ] && [ "$minos" != "${{ inputs.deployment_target }}" ]; then
+              echo "$f targets macOS $minos, expected ${{ inputs.deployment_target }}"
+              exit 1
+            fi
+          done
+          # The sidecar must resolve next to the executable, not from the
+          # build tree (crispasr_enable_c2pa sets @loader_path).
+          otool -L release/crispasr-macos/crispasr | grep -i c2pa
+          # Nothing may link against a package manager prefix - those libraries
+          # do not exist on a user's Mac (and are arm64 here anyway).
+          if otool -L release/crispasr-macos/crispasr | grep -E '/opt/homebrew|/usr/local|/opt/local'; then
+            echo "binary links against a package-manager prefix"; exit 1
+          fi
+
+      - name: Smoke test (best effort - needs Rosetta on the runner)
+        continue-on-error: true
+        run: |
+          arch -x86_64 release/crispasr-macos/crispasr --help | head -20 || \
+            echo "x86_64 binaries cannot be executed on this runner; verified statically above"
+
+      - name: Pack crispasr-macos-x86_64.tar.gz
+        run: |
+          set -euo pipefail
+          cd release && tar czf ../crispasr-macos-x86_64.tar.gz crispasr-macos/
+          cd .. && tar tzvf crispasr-macos-x86_64.tar.gz && ls -lh crispasr-macos-x86_64.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-macos-x86_64
+          path: crispasr-macos-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: macos-x64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show staged archives
+        run: ls -la artifacts/*/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/crispasr-macos-x86_64/crispasr-macos-x86_64.tar.gz
