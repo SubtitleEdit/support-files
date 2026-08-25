@@ -127,6 +127,8 @@ jobs:
           grep -qi "standalone" smoke-out/smoke_test.srt
 
       - name: Install 7-Zip (macOS / Linux)
+        # Ubuntu's 7zip package names the binary 7z; Homebrew's sevenzip names
+        # it 7zz. The pack step resolves whichever exists.
         if: runner.os != 'Windows'
         shell: bash
         run: |
@@ -135,7 +137,7 @@ jobs:
           else
             sudo apt-get install -y 7zip
           fi
-          command -v 7zz
+          command -v 7zz || command -v 7z
 
       - name: Package as 7z (macOS / Linux)
         # cp -RL materializes symlinks as real files before packing — see the
@@ -148,9 +150,10 @@ jobs:
           cp -RL whisperx-standalone whisperx-standalone-pack
           find whisperx-standalone-pack -type l | tee dangling-links.txt
           test ! -s dangling-links.txt
+          sz=$(command -v 7zz || command -v 7z)
           cd whisperx-standalone-pack
-          7zz a -t7z -mx=9 "../whisperx-standalone-${{ matrix.name }}.7z" .
-          7zz l "../whisperx-standalone-${{ matrix.name }}.7z" | tail -5
+          "$sz" a -t7z -mx=9 "../whisperx-standalone-${{ matrix.name }}.7z" .
+          "$sz" l "../whisperx-standalone-${{ matrix.name }}.7z" | tail -5
 
       - name: Package as 7z (Windows)
         if: runner.os == 'Windows'
