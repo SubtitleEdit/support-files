@@ -1,0 +1,192 @@
+name: Build WhisperX standalone release archives
+
+# Produces the three WhisperX standalone archives consumed by SubtitleEdit's
+# WhisperDownloadService for the WhisperX speech-to-text engine (SubtitleEdit
+# PR #14070): whisperx-standalone-windows-x64.7z, whisperx-standalone-linux-x64.7z
+# and whisperx-standalone-macos-arm64.7z.
+#
+# WhisperX is Python, so the "no Python, no pip" packaging is a PyInstaller
+# freeze. The build scripts, pinned requirements and entry point all live in
+# the source repo (muaz978/subtitleedit-whisperx-standalone — packaging/);
+# this workflow checks that repo out at a pinned ref and runs its scripts,
+# so the archives SubtitleEdit downloads are built and published under the
+# SubtitleEdit org rather than depending on a personal repo's releases.
+# Switch whisperx_repo to a SubtitleEdit fork if upstream ever needs patching.
+#
+# Archives are .7z, not .zip (the source repo publishes zips): LZMA2 cuts a
+# PyInstaller payload roughly a third versus deflate, and SubtitleEdit already
+# has the full 7z install path — Purfview Faster-Whisper-XXL (same CT2/torch
+# stack, ~1.5 GB) downloads to a file and unpacks via Unpacker.Extract7Zip.
+# The pack step compresses a `cp -RL` DEREFERENCED copy of the dist: 7z on
+# Unix stores symlinks as links, and SubtitleEdit's managed fallback extractor
+# (used e.g. on Macs without a Homebrew 7zz) writes a symlink entry out as an
+# ordinary file containing the target path — the same failure class as the
+# whisper.cpp Linux zips in issue #13680. Dereferencing matches what the
+# source repo's `zip -r` (no -y) produced, so the unpacked layout is identical.
+#
+# The smoke test transcribes a committed real-speech recording with the exact
+# default pipeline (alignment included — a previous --no_align variant of the
+# test let an SSL cert bug through because it never exercised the torch.hub
+# model-download path) and asserts on the transcribed content, not just a
+# clean exit.
+#
+# WhisperX shells out to a real ffmpeg binary for audio loading — ffmpeg is
+# NOT bundled in the standalone build. Subtitle Edit puts its own configured
+# ffmpeg on PATH for the process at runtime; the ffmpeg install step here
+# exists only so the smoke test can prove that handoff works.
+#
+# Dispatch manually with workflow_dispatch. Defaults target v1.0.1 of the
+# source repo; bump whisperx_ref / release_tag for future releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisperx_repo:
+        description: 'Source repository (switch to a SubtitleEdit fork here if we ever need to patch it)'
+        required: true
+        default: 'muaz978/subtitleedit-whisperx-standalone'
+      whisperx_ref:
+        description: 'Source git ref (tag, branch or commit SHA)'
+        required: true
+        default: '17a2a8c16bc85797c4742e9b85b81bdb65bc8672'
+      release_tag:
+        description: 'Tag for the resulting support-files release'
+        required: true
+        default: 'whisperx-standalone-101'
+      release_name:
+        description: 'Display name for the release'
+        required: true
+        default: 'WhisperX standalone v1.0.1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x64
+          - os: ubuntu-latest
+            name: linux-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Clone WhisperX standalone source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.whisperx_repo }}
+          ref: ${{ inputs.whisperx_ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build (macOS / Linux)
+        if: runner.os != 'Windows'
+        working-directory: packaging
+        run: bash build.sh
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        working-directory: packaging
+        run: .\build.ps1
+        shell: pwsh
+
+      - name: Install ffmpeg (smoke test only — see header note)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            brew install ffmpeg
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          else
+            choco install ffmpeg -y
+          fi
+
+      - name: Smoke test — transcribe real speech with the default pipeline
+        # test-assets/smoke_test.wav is a committed recording ("This is a test
+        # of the Whisper X standalone speech to text engine."), so the greps
+        # below assert on real transcribed content.
+        working-directory: packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="dist/whisperx-standalone/whisperx-standalone"
+          if [ "${{ runner.os }}" = "Windows" ]; then exe="dist/whisperx-standalone/whisperx-standalone.exe"; fi
+          mkdir -p smoke-out
+          "$exe" test-assets/smoke_test.wav --model tiny --device cpu --compute_type int8 --output_dir smoke-out --output_format srt
+          cat smoke-out/smoke_test.srt
+          grep -qi "whisper" smoke-out/smoke_test.srt
+          grep -qi "standalone" smoke-out/smoke_test.srt
+
+      - name: Install 7-Zip (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            brew install sevenzip
+          else
+            sudo apt-get install -y 7zip
+          fi
+          command -v 7zz
+
+      - name: Package as 7z (macOS / Linux)
+        # cp -RL materializes symlinks as real files before packing — see the
+        # header note on the managed-extractor symlink failure class.
+        if: runner.os != 'Windows'
+        working-directory: packaging/dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -RL whisperx-standalone whisperx-standalone-pack
+          find whisperx-standalone-pack -type l | tee dangling-links.txt
+          test ! -s dangling-links.txt
+          cd whisperx-standalone-pack
+          7zz a -t7z -mx=9 "../whisperx-standalone-${{ matrix.name }}.7z" .
+          7zz l "../whisperx-standalone-${{ matrix.name }}.7z" | tail -5
+
+      - name: Package as 7z (Windows)
+        if: runner.os == 'Windows'
+        working-directory: packaging/dist
+        shell: pwsh
+        run: |
+          & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=9 "whisperx-standalone-${{ matrix.name }}.7z" ".\whisperx-standalone\*"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisperx-standalone-${{ matrix.name }}
+          path: packaging/dist/whisperx-standalone-${{ matrix.name }}.7z
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Collect the three archives and publish them as a single release.
+  # The first run for a given tag creates the release; reruns update it.
+  # --------------------------------------------------------------------
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show staged archives
+        run: ls -la artifacts/*/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/whisperx-standalone-macos-arm64/whisperx-standalone-macos-arm64.7z
+            artifacts/whisperx-standalone-windows-x64/whisperx-standalone-windows-x64.7z
+            artifacts/whisperx-standalone-linux-x64/whisperx-standalone-linux-x64.7z
