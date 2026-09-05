@@ -29,7 +29,7 @@ name: Build whisper.cpp release zips
 # step is the regression guard — whispercpp-184/186/191 all shipped Linux
 # archives with no libwhisper.so at all and nothing caught it.
 #
-# Dispatch manually with workflow_dispatch. Defaults target v1.9.1; bump
+# Dispatch manually with workflow_dispatch. Defaults target v1.9.2; bump
 # `whisper_ref` / `release_tag` for future releases.
 
 on:
@@ -38,15 +38,15 @@ on:
       whisper_ref:
         description: 'whisper.cpp git ref (must match an upstream release tag for the Windows BLAS repack)'
         required: true
-        default: 'v1.9.1'
+        default: 'v1.9.2'
       release_tag:
         description: 'Tag for the resulting support-files release'
         required: true
-        default: 'whispercpp-191-r2'
+        default: 'whispercpp-192'
       release_name:
         description: 'Display name for the release'
         required: true
-        default: 'Whisper CPP v1.9.1 (r2 - Linux shared library fix)'
+        default: 'Whisper CPP v1.9.2'
       silero_url:
         description: 'URL of ggml-silero-v6.2.0.zip (the VAD model bundled into 4 of the 5 archives)'
         required: true
