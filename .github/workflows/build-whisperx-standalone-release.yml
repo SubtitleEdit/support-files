@@ -35,8 +35,22 @@ name: Build WhisperX standalone release archives
 # ffmpeg on PATH for the process at runtime; the ffmpeg install step here
 # exists only so the smoke test can prove that handoff works.
 #
+# The "Patch entry point" step prepends a small prelude to the source repo's
+# whisperx_entry.py (SubtitleEdit issue #15096). A PyInstaller-frozen app runs
+# with an isolated interpreter config, so the PYTHONUNBUFFERED / PYTHONUTF8 /
+# PYTHONIOENCODING / PYTHONWARNINGS variables Subtitle Edit sets for the
+# process are silently ignored: stdout stayed block-buffered when piped (the
+# "Transcript: [...]" lines Subtitle Edit turns into progress only arrived
+# once transcription was over, so a long CPU run looked hung), and pyannote's
+# harmless "torchcodec is not installed correctly" warning - torchcodec is
+# excluded from the build on purpose, WhisperX feeds ffmpeg-decoded audio in
+# memory - showed up in every log and got blamed for the "hang". The prelude
+# does in-process what those variables were meant to do. The streaming smoke
+# test below fails the build if either regresses.
+#
 # Dispatch manually with workflow_dispatch. Defaults target v1.0.1 of the
-# source repo; bump whisperx_ref / release_tag for future releases.
+# source repo plus the prelude (release 102); bump whisperx_ref / release_tag
+# for future releases.
 
 on:
   workflow_dispatch:
@@ -52,11 +66,11 @@ on:
       release_tag:
         description: 'Tag for the resulting support-files release'
         required: true
-        default: 'whisperx-standalone-101'
+        default: 'whisperx-standalone-102'
       release_name:
         description: 'Display name for the release'
         required: true
-        default: 'WhisperX standalone v1.0.1'
+        default: 'WhisperX standalone v1.0.2'
 
 permissions:
   contents: write
@@ -87,6 +101,37 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      - name: Patch entry point - line-buffered UTF-8 output, no torchcodec warning
+        # See the header note. Prepended (not appended) so it runs before the
+        # entry script imports whisperx, which is what triggers the warning.
+        working-directory: packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > se_prelude.py <<'EOF'
+          # --- Subtitle Edit support-files prelude (SubtitleEdit issue #15096) ---
+          # PyInstaller ignores PYTHON* environment variables, so do their job here.
+          import sys as _se_sys
+          import warnings as _se_warnings
+
+          for _se_stream in (_se_sys.stdout, _se_sys.stderr):
+              if _se_stream is not None and hasattr(_se_stream, "reconfigure"):
+                  _se_stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
+          _se_warnings.filterwarnings(
+              "ignore",
+              message=r"\s*torchcodec is not installed correctly",
+              category=UserWarning,
+          )
+          # --- end of prelude ---
+
+          EOF
+          cat se_prelude.py whisperx_entry.py > whisperx_entry.patched.py
+          mv whisperx_entry.patched.py whisperx_entry.py
+          rm -f se_prelude.py
+          python -m py_compile whisperx_entry.py
+          head -20 whisperx_entry.py
 
       - name: Build (macOS / Linux)
         if: runner.os != 'Windows'
@@ -125,6 +170,56 @@ jobs:
           cat smoke-out/smoke_test.srt
           grep -qi "whisper" smoke-out/smoke_test.srt
           grep -qi "standalone" smoke-out/smoke_test.srt
+
+      - name: Smoke test — output streams while transcribing, no torchcodec warning
+        # Runs the frozen build the way Subtitle Edit does (stdout/stderr piped)
+        # on a ~5 min loop of the test recording with --batch_size 1, so the
+        # "Transcript:" lines are produced seconds apart. Block-buffered stdout
+        # delivers them in a single burst when transcription ends; the check
+        # requires them to be spread out. See the header note.
+        working-directory: packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="dist/whisperx-standalone/whisperx-standalone"
+          if [ "${{ runner.os }}" = "Windows" ]; then exe="dist/whisperx-standalone/whisperx-standalone.exe"; fi
+          ffmpeg -v error -y -stream_loop 80 -i test-assets/smoke_test.wav -ar 16000 -ac 1 smoke-out/long.wav
+          cat > stream_check.py <<'EOF'
+          import os, subprocess, sys, time
+
+          sys.stdout.reconfigure(errors="replace")
+          exe = sys.argv[1]
+          cmd = [exe, "smoke-out/long.wav", "--model", "tiny", "--device", "cpu", "--compute_type", "int8",
+                 "--language", "en", "--batch_size", "1", "--no_align",
+                 "--output_dir", "smoke-out", "--output_format", "srt"]
+          p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          stamps, lines = [], []
+          for raw in p.stdout:
+              line = raw.decode("utf-8", errors="replace").rstrip()
+              lines.append(line)
+              print(f"{time.monotonic():10.2f} | {line}", flush=True)
+              if line.startswith("Transcript:"):
+                  stamps.append(time.monotonic())
+          code = p.wait()
+          srt = "smoke-out/long.srt"
+          if not os.path.isfile(srt) or os.path.getsize(srt) == 0:
+              sys.exit(f"no SRT written (exit code {code})")
+          if code != 0:
+              # Seen once locally on macOS with the 101 build: the native libraries
+              # abort during interpreter teardown ("recursive_mutex lock failed"),
+              # after the SRT is complete. Rare and unrelated to what this test is
+              # about, so flag it without failing a 20 minute build over it.
+              print(f"::warning::whisperx exited with {code} after writing its output")
+          if any("torchcodec" in l for l in lines):
+              sys.exit("torchcodec warning is still printed")
+          if len(stamps) < 4:
+              sys.exit(f"expected several Transcript lines, got {len(stamps)}")
+          spread = stamps[-1] - stamps[0]
+          print(f"{len(stamps)} Transcript lines spread over {spread:.2f}s")
+          if spread < 1.0:
+              sys.exit("Transcript lines arrived in one burst - stdout is still block-buffered")
+          EOF
+          python stream_check.py "$exe"
 
       - name: Install 7-Zip (macOS / Linux)
         # Ubuntu's 7zip package names the binary 7z; Homebrew's sevenzip names
