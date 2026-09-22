@@ -48,9 +48,20 @@ name: Build WhisperX standalone release archives
 # does in-process what those variables were meant to do. The streaming smoke
 # test below fails the build if either regresses.
 #
+# The "Migrate the pyannote VAD checkpoint" step (SubtitleEdit issue #15170)
+# upgrades whisperx's bundled voice-activity checkpoint in place after the
+# build. It was saved with pytorch-lightning 1.5.4, so Lightning 2.x migrates
+# it in memory on every launch and prints "Lightning automatically upgraded
+# your loaded checkpoint from v1.5.4 to v2.6.6. To apply the upgrade to your
+# files permanently, run `python -m lightning.pytorch.utilities.upgrade_checkpoint ...`"
+# - a command the user of a frozen build cannot run. The step writes to disk
+# exactly what Lightning already builds in memory (state_dict untouched), and
+# a re-run of the migration on the result is a no-op, which is Lightning's own
+# condition for staying silent. The first smoke test fails if the line is back.
+#
 # Dispatch manually with workflow_dispatch. Defaults target v1.0.1 of the
-# source repo plus the prelude (release 102); bump whisperx_ref / release_tag
-# for future releases.
+# source repo plus the prelude and the migrated checkpoint (release 103); bump
+# whisperx_ref / release_tag for future releases.
 
 on:
   workflow_dispatch:
@@ -66,11 +77,11 @@ on:
       release_tag:
         description: 'Tag for the resulting support-files release'
         required: true
-        default: 'whisperx-standalone-102'
+        default: 'whisperx-standalone-103'
       release_name:
         description: 'Display name for the release'
         required: true
-        default: 'WhisperX standalone v1.0.2'
+        default: 'WhisperX standalone v1.0.3'
 
 permissions:
   contents: write
@@ -144,6 +155,47 @@ jobs:
         run: .\build.ps1
         shell: pwsh
 
+      - name: Migrate the pyannote VAD checkpoint - no "Lightning automatically upgraded" line
+        # See the header note. Runs with the build venv's interpreter (same torch and
+        # lightning the frozen build ships) against the copy PyInstaller placed in the
+        # dist folder. Fails if there was nothing to migrate: that means the source repo
+        # updated the asset and this step can go.
+        working-directory: packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          py="venv/bin/python"
+          if [ "${{ runner.os }}" = "Windows" ]; then py="venv/Scripts/python.exe"; fi
+          asset="dist/whisperx-standalone/_internal/whisperx/assets/pytorch_model.bin"
+          test -f "$asset"
+          cat > migrate_vad.py <<'EOF'
+          import sys, torch, lightning
+          from lightning.pytorch.utilities.migration import migrate_checkpoint, pl_legacy_patch
+
+          path = sys.argv[1]
+          print("torch", torch.__version__, "lightning", lightning.__version__)
+          with pl_legacy_patch():
+              ckpt = torch.load(path, map_location="cpu", weights_only=False)
+          state_dict = {k: v.clone() for k, v in ckpt["state_dict"].items()}
+          ckpt, applied = migrate_checkpoint(ckpt)
+          if not applied:
+              sys.exit("nothing to migrate - the bundled checkpoint is already current, drop this step")
+          print("applied:", [str(m) for m in applied])
+          assert "pyannote.audio" in ckpt, "pyannote specification lost"
+          assert ckpt["state_dict"].keys() == state_dict.keys()
+          assert all(torch.equal(ckpt["state_dict"][k], state_dict[k]) for k in state_dict)
+          torch.save(ckpt, path)
+
+          # Lightning stays silent only when a re-run migrates nothing - prove it.
+          with pl_legacy_patch():
+              again = torch.load(path, map_location="cpu", weights_only=False)
+          _, applied_again = migrate_checkpoint(again)
+          if applied_again:
+              sys.exit(f"migration is not idempotent: {applied_again}")
+          print("migrated", path)
+          EOF
+          "$py" migrate_vad.py "$asset"
+
       - name: Install ffmpeg (smoke test only — see header note)
         shell: bash
         run: |
@@ -166,10 +218,15 @@ jobs:
           exe="dist/whisperx-standalone/whisperx-standalone"
           if [ "${{ runner.os }}" = "Windows" ]; then exe="dist/whisperx-standalone/whisperx-standalone.exe"; fi
           mkdir -p smoke-out
-          "$exe" test-assets/smoke_test.wav --model tiny --device cpu --compute_type int8 --output_dir smoke-out --output_format srt
+          "$exe" test-assets/smoke_test.wav --model tiny --device cpu --compute_type int8 --output_dir smoke-out --output_format srt 2>&1 | tee smoke-out/run.log
           cat smoke-out/smoke_test.srt
           grep -qi "whisper" smoke-out/smoke_test.srt
           grep -qi "standalone" smoke-out/smoke_test.srt
+          # The default pipeline loads the VAD checkpoint; see the header note.
+          if grep -q "Lightning automatically upgraded" smoke-out/run.log; then
+            echo "the bundled VAD checkpoint still triggers Lightning's migration message" >&2
+            exit 1
+          fi
 
       - name: Smoke test — output streams while transcribing, no torchcodec warning
         # Runs the frozen build the way Subtitle Edit does (stdout/stderr piped)
