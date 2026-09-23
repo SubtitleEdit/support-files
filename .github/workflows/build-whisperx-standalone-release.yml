@@ -260,7 +260,7 @@ jobs:
           set -euo pipefail
           py="venv/bin/python"
           if [ "${{ runner.os }}" = "Windows" ]; then py="venv/Scripts/python.exe"; fi
-          "$py" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'arch', torch.cuda.get_arch_list())"
+          "$py" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'arch', torch._C._cuda_getArchFlags() if torch.version.cuda else None)"
           if [ "${{ matrix.torch_index }}" = "cpu" ]; then
             "$py" -c "import torch, sys; sys.exit(1 if torch.version.cuda else 0)"
           else
@@ -270,6 +270,9 @@ jobs:
             grep -qi cublas cuda-libs.txt
           fi
           du -sh dist/whisperx-standalone
+          echo "dereferenced: $(du -shL dist/whisperx-standalone | cut -f1), symlinks: $(find dist/whisperx-standalone -type l | wc -l)"
+          # Largest files, for keeping the archives under the release asset limit.
+          "$py" -c "import os, sys; r = sys.argv[1]; fs = [(os.path.getsize(os.path.join(d, f)), os.path.join(d, f)) for d, _, n in os.walk(r) for f in n if not os.path.islink(os.path.join(d, f))]; [print(f'{z >> 20:6} MiB  {p}') for z, p in sorted(fs, reverse=True)[:60]]" dist/whisperx-standalone
 
       - name: Remove the build venv (Linux CUDA)
         # Frees disk for the dereferenced pack copy; nothing below uses the venv.
@@ -400,8 +403,15 @@ jobs:
         run: |
           & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=9 "whisperx-standalone-${{ matrix.name }}.7z" ".\whisperx-standalone\*"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisperx-standalone-${{ matrix.name }}
+          path: packaging/dist/whisperx-standalone-${{ matrix.name }}.7z
+          if-no-files-found: error
+
       - name: Check archive size
-        # GitHub refuses release assets of 2 GiB or more.
+        # GitHub refuses release assets of 2 GiB or more. After the upload, so an
+        # oversized archive can still be downloaded and inspected.
         working-directory: packaging/dist
         shell: bash
         run: |
@@ -410,12 +420,6 @@ jobs:
           size=$(wc -c < "$f")
           echo "$f: $((size / 1048576)) MiB"
           test "$size" -lt 2147483648
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: whisperx-standalone-${{ matrix.name }}
-          path: packaging/dist/whisperx-standalone-${{ matrix.name }}.7z
-          if-no-files-found: error
 
   # --------------------------------------------------------------------
   # Collect the five archives and publish them as a single release.
