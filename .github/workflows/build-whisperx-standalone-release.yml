@@ -59,6 +59,19 @@ name: Build WhisperX standalone release archives
 # a re-run of the migration on the result is a no-op, which is Lightning's own
 # condition for staying silent. The first smoke test fails if the line is back.
 #
+# The two "-cuda" matrix entries (SubtitleEdit issue #15206) build the same
+# freeze against PyTorch's CUDA 12.8 wheels instead of the CPU-only ones, so
+# "--device cuda" works on NVIDIA GPUs. The source repo's build scripts pin the
+# CPU wheel index; the "Select the PyTorch wheel index" step rewrites that one
+# URL per matrix entry (same approach as the entry-point prelude). cu128 rather
+# than cu126 because only cu128 has kernels for the RTX 50 series (sm_120).
+# CTranslate2's Windows wheel already has CUDA (a CPU-build run with
+# "--device cuda" only failed in torch, #15206); on Linux the CUDA libraries
+# come as separate nvidia-* pip packages, so the build step collects them too.
+# The runners have no GPU: the CUDA builds run the same CPU smoke tests, plus a
+# check that the CUDA libraries were bundled and the archive stays under
+# GitHub's 2 GiB release asset limit. A real GPU run has to happen elsewhere.
+#
 # Dispatch manually with workflow_dispatch. Defaults target v1.0.1 of the
 # source repo plus the prelude and the migrated checkpoint (release 103); bump
 # whisperx_ref / release_tag for future releases.
@@ -82,6 +95,11 @@ on:
         description: 'Display name for the release'
         required: true
         default: 'WhisperX standalone v1.0.3'
+      publish:
+        description: 'Publish the release (off = only upload the archives as workflow artifacts, for test builds)'
+        type: boolean
+        required: true
+        default: true
 
 permissions:
   contents: write
@@ -94,10 +112,19 @@ jobs:
         include:
           - os: macos-14
             name: macos-arm64
+            torch_index: cpu
           - os: windows-latest
             name: windows-x64
+            torch_index: cpu
           - os: ubuntu-latest
             name: linux-x64
+            torch_index: cpu
+          - os: windows-latest
+            name: windows-x64-cuda
+            torch_index: cu128
+          - os: ubuntu-latest
+            name: linux-x64-cuda
+            torch_index: cu128
 
     runs-on: ${{ matrix.os }}
 
@@ -143,6 +170,33 @@ jobs:
           rm -f se_prelude.py
           python -m py_compile whisperx_entry.py
           head -20 whisperx_entry.py
+
+      - name: Free disk space (Linux CUDA)
+        # The CUDA venv, the dist folder and its dereferenced copy for packing
+        # need well over the ~14 GB an ubuntu-latest runner has free.
+        if: runner.os == 'Linux' && matrix.torch_index != 'cpu'
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Select the PyTorch wheel index
+        # See the header note. Fails if the source repo stopped pinning the CPU
+        # index this way, so a CUDA build can never silently ship CPU torch.
+        working-directory: packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in build.sh build.ps1; do
+            grep -q "https://download.pytorch.org/whl/cpu" "$f"
+          done
+          if [ "${{ matrix.torch_index }}" != "cpu" ]; then
+            sed -i.bak "s#https://download.pytorch.org/whl/cpu#https://download.pytorch.org/whl/${{ matrix.torch_index }}#" build.sh build.ps1
+            # Linux CUDA torch loads cuDNN/cuBLAS/... from the nvidia-* pip packages.
+            sed -i.bak "s#--collect-all onnxruntime#--collect-all onnxruntime --collect-binaries nvidia#" build.sh
+            rm -f build.sh.bak build.ps1.bak
+          fi
+          grep -n "download.pytorch.org\|collect-binaries" build.sh build.ps1
 
       - name: Build (macOS / Linux)
         if: runner.os != 'Windows'
@@ -195,6 +249,36 @@ jobs:
           print("migrated", path)
           EOF
           "$py" migrate_vad.py "$asset"
+
+      - name: Check the PyTorch build
+        # Runs in the build venv - the frozen app cannot run arbitrary Python. A CUDA
+        # entry must have CUDA torch and its libraries in the dist; the arch list shows
+        # which GPU generations the build supports.
+        working-directory: packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          py="venv/bin/python"
+          if [ "${{ runner.os }}" = "Windows" ]; then py="venv/Scripts/python.exe"; fi
+          "$py" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'arch', torch.cuda.get_arch_list())"
+          if [ "${{ matrix.torch_index }}" = "cpu" ]; then
+            "$py" -c "import torch, sys; sys.exit(1 if torch.version.cuda else 0)"
+          else
+            "$py" -c "import torch, sys; sys.exit(0 if torch.version.cuda else 1)"
+            find dist/whisperx-standalone -iname "*cudnn*" -o -iname "*cublas*" | tee cuda-libs.txt
+            grep -qi cudnn cuda-libs.txt
+            grep -qi cublas cuda-libs.txt
+          fi
+          du -sh dist/whisperx-standalone
+
+      - name: Remove the build venv (Linux CUDA)
+        # Frees disk for the dereferenced pack copy; nothing below uses the venv.
+        if: runner.os == 'Linux' && matrix.torch_index != 'cpu'
+        working-directory: packaging
+        shell: bash
+        run: |
+          rm -rf venv build
+          df -h /
 
       - name: Install ffmpeg (smoke test only — see header note)
         shell: bash
@@ -306,6 +390,8 @@ jobs:
           cd whisperx-standalone-pack
           "$sz" a -t7z -mx=9 "../whisperx-standalone-${{ matrix.name }}.7z" .
           "$sz" l "../whisperx-standalone-${{ matrix.name }}.7z" | tail -5
+          cd ..
+          rm -rf whisperx-standalone-pack
 
       - name: Package as 7z (Windows)
         if: runner.os == 'Windows'
@@ -314,6 +400,17 @@ jobs:
         run: |
           & "C:\Program Files\7-Zip\7z.exe" a -t7z -mx=9 "whisperx-standalone-${{ matrix.name }}.7z" ".\whisperx-standalone\*"
 
+      - name: Check archive size
+        # GitHub refuses release assets of 2 GiB or more.
+        working-directory: packaging/dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="whisperx-standalone-${{ matrix.name }}.7z"
+          size=$(wc -c < "$f")
+          echo "$f: $((size / 1048576)) MiB"
+          test "$size" -lt 2147483648
+
       - uses: actions/upload-artifact@v4
         with:
           name: whisperx-standalone-${{ matrix.name }}
@@ -321,11 +418,12 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------
-  # Collect the three archives and publish them as a single release.
+  # Collect the five archives and publish them as a single release.
   # The first run for a given tag creates the release; reruns update it.
   # --------------------------------------------------------------------
   release:
     needs: build
+    if: ${{ inputs.publish }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -345,3 +443,5 @@ jobs:
             artifacts/whisperx-standalone-macos-arm64/whisperx-standalone-macos-arm64.7z
             artifacts/whisperx-standalone-windows-x64/whisperx-standalone-windows-x64.7z
             artifacts/whisperx-standalone-linux-x64/whisperx-standalone-linux-x64.7z
+            artifacts/whisperx-standalone-windows-x64-cuda/whisperx-standalone-windows-x64-cuda.7z
+            artifacts/whisperx-standalone-linux-x64-cuda/whisperx-standalone-linux-x64-cuda.7z
