@@ -572,14 +572,44 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          REPO: ${{ github.repository }}
+        # Create the release empty, then upload each asset on its own with retries. A single
+        # `gh release create TAG release/*` deletes the whole release and its tag when any one
+        # upload fails (HTTP 422 on an internally retried upload, or HTTP 500 on the large CUDA
+        # archives), throwing away a 2 h build. --clobber makes a retry of an upload that in fact
+        # succeeded harmless.
         run: |
-          gh release create "${{ inputs.release_tag }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ inputs.release_name }}" \
-            --notes "audio.cpp composite build (\`${{ inputs.models }}\`) for SubtitleEdit's IndexTTS-2.5 engine.
+          if ! gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "${{ inputs.release_name }}" \
+              --notes "audio.cpp composite build (\`${{ inputs.models }}\`) for SubtitleEdit's IndexTTS-2.5 engine.
 
           Source: [${{ inputs.audiocpp_repo }}](https://github.com/${{ inputs.audiocpp_repo }}) @ \`${{ inputs.audiocpp_ref }}\`, Apache-2.0.
           Binaries only — IndexTTS-2.5 weights are downloaded from Hugging Face at runtime and carry the separate bilibili Model Use License.
 
-          See SHA256SUMS.txt for the hashes to add to DownloadHashManager." \
-            release/*
+          See SHA256SUMS.txt for the hashes to add to DownloadHashManager."
+          fi
+
+          for f in release/*; do
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$f" --repo "$REPO" --clobber; then
+                ok=1
+                break
+              fi
+              echo "::warning::upload of $(basename "$f") failed (attempt $attempt), retrying"
+              sleep $((attempt * 20))
+            done
+            if [ "$ok" != 1 ]; then
+              echo "::error::could not upload $(basename "$f")"
+              exit 1
+            fi
+          done
+
+          # Every archive must be on the release with the size we built.
+          gh release view "$TAG" --repo "$REPO" --json assets \
+            -q '.assets[] | "\(.name) \(.size)"' | sort > published.txt
+          (cd release && for f in *; do echo "$f $(stat -c%s "$f")"; done) | sort > built.txt
+          diff built.txt published.txt
