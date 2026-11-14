@@ -333,11 +333,25 @@ jobs:
           repository: ggml-org/whisper.cpp
           ref: ${{ inputs.whisper_ref }}
 
+      # macOS 12 support (SubtitleEdit issue #16897). Subtitle Edit runs on
+      # macOS 12+, but without an explicit deployment target the binary
+      # inherits the runner's OS as its minimum (whispercpp-195 had minos
+      # 26.0). Separately, ggml's Apple BLAS backend defines
+      # ACCELERATE_NEW_LAPACK + ACCELERATE_LAPACK_ILP64, which links
+      # cblas_sgemm$NEWLAPACK$ILP64 - a macOS 13.3+ symbol, so dyld aborts
+      # on older systems before whisper-cli even starts. The -U flags land
+      # after cmake's -D defines on the compile line and switch back to the
+      # classic cblas_sgemm, keeping Accelerate BLAS for the CPU path
+      # (turning GGML_BLAS off instead made CPU-only runs ~50% slower).
       - name: Configure (Universal arm64+x86_64)
         run: |
+          ACCEL_CLASSIC="-UACCELERATE_NEW_LAPACK -UACCELERATE_LAPACK_ILP64"
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_C_FLAGS="$ACCEL_CLASSIC" \
+            -DCMAKE_CXX_FLAGS="$ACCEL_CLASSIC" \
             -DGGML_METAL=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DGGML_NATIVE=OFF \
@@ -347,10 +361,19 @@ jobs:
       - name: Build whisper-cli
         run: cmake --build build --config Release --target whisper-cli -j $(sysctl -n hw.logicalcpu)
 
-      - name: Verify universal
+      - name: Verify universal + macOS 12 compatible
         run: |
           file build/bin/whisper-cli
           lipo -info build/bin/whisper-cli
+          vtool -show-build build/bin/whisper-cli
+          if vtool -show-build build/bin/whisper-cli | grep minos | grep -qv ' 12\.0$'; then
+            echo "::error::whisper-cli minimum macOS is not 12.0"; exit 1
+          fi
+          for a in arm64 x86_64; do
+            if nm -u -arch $a build/bin/whisper-cli | grep -q 'NEWLAPACK'; then
+              echo "::error::$a slice links a macOS 13.3+ NEWLAPACK symbol"; exit 1
+            fi
+          done
 
       - name: Stage release bits
         run: |
