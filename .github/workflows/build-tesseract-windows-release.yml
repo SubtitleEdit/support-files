@@ -1,0 +1,256 @@
+name: Build Tesseract Windows release zip
+
+# Produces `Tesseract<ver>.zip`, the Windows x64 Tesseract runtime that
+# SubtitleEdit's TesseractDownloadService downloads into [Data Folder]/Tesseract.
+#
+# Up to 5.5.3 this zip was repacked by hand from the official installer
+# (tesseract-ocr-w64-setup-<ver>.<date>.exe, attached to the upstream GitHub
+# release). For 5.5.4 upstream published no Windows installer, so this
+# workflow builds one with upstream's own recipe - `nsis/build.sh x86_64` on
+# Ubuntu 24.04, exactly what upstream's "Cross build for Windows" workflow
+# runs - and then applies the same repack as before:
+#
+#   - Unpack the NSIS installer with 7z.
+#   - Keep tesseract.exe plus the DLLs in its PE import closure (walked
+#     transitively). The training tools and everything only they need
+#     (pango, cairo, harfbuzz, fontconfig, ICU incl. the ~33 MB libicudt*.dll)
+#     are left out; SubtitleEdit never runs them. The closure is computed,
+#     not copied from the previous zip, because MSYS2 DLL names change
+#     between builds (build.sh installs the current MSYS2 packages).
+#   - tessdata/osd.traineddata is not in the installer (it downloads language
+#     data at install time), so it is carried over from the previous zip,
+#     with its SHA-256 checked.
+#
+# The zip is flat (tesseract.exe at the root, tessdata/ next to it), same as
+# Tesseract553.zip.
+#
+# Triggers:
+#   - workflow_dispatch: build, smoke test on Windows, and (with
+#     create_release) publish the zip as a release.
+#   - pull_request touching this file: build + smoke test only, so a change
+#     can be verified before it lands on master.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tesseract_ref:
+        description: 'tesseract-ocr/tesseract git ref to build (a release tag)'
+        required: true
+        default: '5.5.4'
+      release_tag:
+        description: 'Tag for the resulting support-files release'
+        required: true
+        default: 'tesseract554'
+      zip_name:
+        description: 'File name of the zip (SubtitleEdit pins this in TesseractDownloadService.WindowsUrl)'
+        required: true
+        default: 'Tesseract554.zip'
+      previous_zip_url:
+        description: 'Previous support-files zip to take tessdata/osd.traineddata from'
+        required: true
+        default: 'https://github.com/SubtitleEdit/support-files/releases/download/tesseract553/Tesseract553.zip'
+      create_release:
+        description: 'Publish the zip as a support-files release'
+        type: boolean
+        required: true
+        default: false
+  pull_request:
+    paths:
+      - '.github/workflows/build-tesseract-windows-release.yml'
+
+env:
+  TESSERACT_REF: ${{ inputs.tesseract_ref || '5.5.4' }}
+  RELEASE_TAG: ${{ inputs.release_tag || 'tesseract554' }}
+  ZIP_NAME: ${{ inputs.zip_name || 'Tesseract554.zip' }}
+  PREVIOUS_ZIP_URL: ${{ inputs.previous_zip_url || 'https://github.com/SubtitleEdit/support-files/releases/download/tesseract553/Tesseract553.zip' }}
+  # SHA-256 of tessdata/osd.traineddata inside Tesseract553.zip.
+  OSD_SHA256: '9cf5d576fcc47564f11265841e5ca839001e7e6f38ff7f7aacf46d15a96b00ff'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tesseract-ocr/tesseract
+        uses: actions/checkout@v4
+        with:
+          repository: tesseract-ocr/tesseract
+          ref: ${{ env.TESSERACT_REF }}
+          path: tesseract
+          # build.sh tags the checkout and reads VERSION.
+          fetch-depth: 0
+
+      - name: Build the installer with upstream's nsis/build.sh
+        working-directory: tesseract
+        run: nsis/build.sh x86_64
+
+      - name: Unpack the installer
+        run: |
+          set -euo pipefail
+          sudo apt-get install --assume-yes --no-install-recommends --quiet p7zip-full
+          installer=$(ls tesseract/bin/ndebug/x86_64-w64-mingw32/nsis/tesseract-ocr-w64-setup-*.exe)
+          echo "Installer: $installer"
+          sha256sum "$installer" | tee installer.sha256
+          basename "$installer" > installer.name
+          7z x -y -oinstaller "$installer" > /dev/null
+          find installer -maxdepth 2 | sort | head -80
+
+      - name: Stage tesseract.exe and its DLL closure
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          venv/bin/pip install --quiet pefile
+          exe=$(find installer -type f -iname tesseract.exe | head -1)
+          test -n "$exe"
+          bindir=$(dirname "$exe")
+          echo "bin dir: $bindir"
+          mkdir -p package/tessdata/configs
+          venv/bin/python - "$bindir" package <<'PY'
+          import os, shutil, sys, pefile
+          bindir, out = sys.argv[1], sys.argv[2]
+          local = {f.lower(): f for f in os.listdir(bindir) if f.lower().endswith('.dll')}
+          # Windows system / API-set DLLs that are expected to be resolved by the OS.
+          system = {
+              'kernel32.dll', 'user32.dll', 'gdi32.dll', 'advapi32.dll', 'shell32.dll',
+              'ole32.dll', 'oleaut32.dll', 'msvcrt.dll', 'ucrtbase.dll', 'ws2_32.dll',
+              'crypt32.dll', 'bcrypt.dll', 'secur32.dll', 'normaliz.dll', 'iphlpapi.dll',
+              'wldap32.dll', 'ntdll.dll', 'shlwapi.dll', 'comdlg32.dll', 'comctl32.dll',
+              'winmm.dll', 'version.dll', 'userenv.dll', 'dnsapi.dll', 'rpcrt4.dll',
+              'setupapi.dll', 'cfgmgr32.dll', 'dbghelp.dll', 'imm32.dll', 'usp10.dll',
+              'msimg32.dll', 'dwrite.dll', 'd2d1.dll', 'winhttp.dll', 'wininet.dll',
+              'psapi.dll', 'powrprof.dll', 'mswsock.dll',
+          }
+          def imports(path):
+              pe = pefile.PE(path, fast_load=True)
+              pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+              return [e.dll.decode().lower() for e in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', [])]
+          seen, todo, unresolved = set(), ['tesseract.exe'], set()
+          while todo:
+              name = todo.pop()
+              path = os.path.join(bindir, 'tesseract.exe' if name == 'tesseract.exe' else local[name])
+              for dep in imports(path):
+                  if dep in local:
+                      if dep not in seen:
+                          seen.add(dep); todo.append(dep)
+                  elif dep.startswith('api-ms-win-') or dep in system:
+                      pass
+                  else:
+                      unresolved.add(dep)
+          if unresolved:
+              sys.exit('Unresolved non-system imports: ' + ', '.join(sorted(unresolved)))
+          shutil.copy2(os.path.join(bindir, 'tesseract.exe'), out)
+          for d in sorted(seen):
+              shutil.copy2(os.path.join(bindir, local[d]), out)
+          print(f'tesseract.exe + {len(seen)} DLLs:')
+          print('\n'.join(local[d] for d in sorted(seen)))
+          left_out = sorted(local[d] for d in set(local) - seen)
+          print(f'\nLeft out ({len(left_out)}): ' + ' '.join(left_out))
+          PY
+
+      - name: Add tessdata (configs/hocr from the installer, osd from the previous zip)
+        run: |
+          set -euo pipefail
+          hocr=$(find installer -path '*tessdata/configs/hocr' -type f | head -1)
+          if [ -n "$hocr" ]; then
+            cp "$hocr" package/tessdata/configs/hocr
+          fi
+          curl -fsSL -o previous.zip "$PREVIOUS_ZIP_URL"
+          mkdir previous && unzip -q previous.zip -d previous
+          [ -f package/tessdata/configs/hocr ] || cp previous/tessdata/configs/hocr package/tessdata/configs/hocr
+          echo "$OSD_SHA256  previous/tessdata/osd.traineddata" | sha256sum -c -
+          cp previous/tessdata/osd.traineddata package/tessdata/osd.traineddata
+          echo "--- compared with the previous zip (< previous, > new)"
+          diff <(cd previous && find . -type f | sort) <(cd package && find . -type f | sort) || true
+
+      - name: Pack the zip
+        run: |
+          set -euo pipefail
+          (cd package && zip -q -r -X "../$ZIP_NAME" .)
+          unzip -l "$ZIP_NAME"
+          sha256sum "$ZIP_NAME"
+          mkdir -p dist && mv "$ZIP_NAME" dist/
+          cp installer.sha256 installer.name dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tesseract-windows
+          path: dist/
+          if-no-files-found: error
+
+  smoke-test:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tesseract-windows
+          path: dist
+
+      - name: Unpack into a clean folder (no MSYS2/MinGW on PATH)
+        shell: pwsh
+        run: |
+          Expand-Archive -Path "dist/$env:ZIP_NAME" -DestinationPath tess
+          Get-ChildItem tess | Select-Object Name, Length
+
+      - name: Version and OCR of a rendered line
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          & tess\tesseract.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "tesseract --version failed: $LASTEXITCODE" }
+          Invoke-WebRequest -Uri 'https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata' -OutFile tess\tessdata\eng.traineddata
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 900, 120
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::White)
+          $font = New-Object System.Drawing.Font 'Arial', 40
+          $g.DrawString('Subtitle Edit 2026', $font, [System.Drawing.Brushes]::Black, 20, 25)
+          $bmp.Save("$PWD\line.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $text = & tess\tesseract.exe line.png - --tessdata-dir tess\tessdata -l eng --psm 7
+          if ($LASTEXITCODE -ne 0) { throw "tesseract OCR failed: $LASTEXITCODE" }
+          Write-Host "OCR: $text"
+          if ("$text" -notmatch 'Subtitle Edit 2026') { throw "unexpected OCR result: $text" }
+          & tess\tesseract.exe --list-langs --tessdata-dir tess\tessdata
+
+  release:
+    needs: [build, smoke-test]
+    if: github.event_name == 'workflow_dispatch' && inputs.create_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tesseract-windows
+          path: dist
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          zip_sha=$(sha256sum "dist/$ZIP_NAME" | cut -d' ' -f1)
+          cat > notes.md <<EOF
+          Tesseract ${TESSERACT_REF} (Windows x64), built by this repo's \`build-tesseract-windows-release.yml\` because upstream published no Windows installer for ${TESSERACT_REF}.
+
+          Built with upstream's own \`nsis/build.sh x86_64\` (the script behind upstream's "Cross build for Windows" workflow) from https://github.com/tesseract-ocr/tesseract/releases/tag/${TESSERACT_REF}, producing \`$(cat dist/installer.name)\`, then repacked the same way as \`tesseract553\`.
+
+          Contents: \`tesseract.exe\` + the DLLs in its PE import closure, \`tessdata/osd.traineddata\` (carried over from tesseract553), \`tessdata/configs/hocr\`. Runtime-only: the training tools and their pango/cairo/harfbuzz/ICU dependencies are excluded.
+
+          Smoke-tested on windows-latest: \`--version\` and OCR of a rendered line with tessdata_fast eng.
+
+          SHA-256 \`${ZIP_NAME}\`: \`${zip_sha}\`
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          sed -i 's/^          //' notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Tesseract ${{ env.TESSERACT_REF }} (Windows x64)
+          body_path: notes.md
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: dist/${{ env.ZIP_NAME }}
