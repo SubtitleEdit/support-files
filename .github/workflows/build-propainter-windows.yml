@@ -1,0 +1,49 @@
+name: Build ProPainter for Windows
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/build-propainter-windows.yml'
+      - 'propainter/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cpu:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Build the portable CPU package
+        run: python propainter/build-windows.py dist
+      - name: Smoke-test the relocated archive on Windows
+        run: python propainter/smoke-windows.py dist/propainter-0.2.0-windows-x64-cpu.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: propainter-windows-x64-cpu
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+
+  windows-cuda-addon:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Build the CUDA add-on and smoke-test the official wheels
+        run: python propainter/build-cuda-addon.py dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: propainter-windows-x64-cuda-addon
+          path: dist/
+          if-no-files-found: error
