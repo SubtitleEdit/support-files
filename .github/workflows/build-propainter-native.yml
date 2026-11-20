@@ -1,0 +1,61 @@
+name: Build native ProPainter
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/propainter-native]
+    paths:
+      - propainter-native/**
+      - .github/workflows/build-propainter-native.yml
+  pull_request:
+    paths:
+      - propainter-native/**
+      - .github/workflows/build-propainter-native.yml
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: CrispStrobe/ggml
+          ref: 3a27b6c665b191cb230be367db5c52d81dd3e2ac
+          path: ggml
+          persist-credentials: false
+      - name: Build C++ CLI and static ggml
+        shell: pwsh
+        run: |
+          cmake -S propainter-native -B build -A x64 "-DGGML_SOURCE=$PWD/ggml" -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --target propainter-native --parallel 4
+      - name: Test full inpainting through the Subtitle Edit stream
+        shell: pwsh
+        run: |
+          $package = "propainter-native-windows-x64"
+          New-Item -ItemType Directory -Path $package | Out-Null
+          gh release download propainter-native-0.3.0 --repo SubtitleEdit/support-files --pattern propainter-native-macos-arm64.tar.gz
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          tar -xzf propainter-native-macos-arm64.tar.gz propainter-native-macos-arm64/models
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Move-Item propainter-native-macos-arm64/models $package
+          Copy-Item build/Release/propainter-native.exe,propainter-native/README.md,propainter-native/LICENSE-*.txt $package
+          ./propainter-native/smoke.ps1 -Executable (Join-Path $PWD "$package/propainter-native.exe")
+          tar -czf "$package.tar.gz" $package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash -Algorithm SHA256 "$package.tar.gz").Hash.ToLowerInvariant()
+          "$hash  $package.tar.gz" | Set-Content -Encoding ascii "$package.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: propainter-native-windows-x64
+          path: |
+            propainter-native-windows-x64.tar.gz
+            propainter-native-windows-x64.tar.gz.sha256
+          compression-level: 0
+          if-no-files-found: error
