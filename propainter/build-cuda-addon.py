@@ -34,8 +34,8 @@ def build(temp, out):
     root = temp / ADDON_ROOT
     root.mkdir()
     with tarfile.open(cpu, 'r:gz') as archive:
-        launch = archive.extractfile('propainter-windows-x64/launch.py').read().decode('utf-8')
-        stream = archive.extractfile('propainter-windows-x64/stream.py').read().decode('utf-8')
+        launch = archive.extractfile('propainter-windows-x64/launch.py').read().decode('utf-8').replace('\r\n', '\n')
+        stream = archive.extractfile('propainter-windows-x64/stream.py').read().decode('utf-8').replace('\r\n', '\n')
         license_text = archive.extractfile('propainter-windows-x64/app/LICENSE').read()
     (root / 'LICENSE').write_bytes(license_text)
 
