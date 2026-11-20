@@ -17,7 +17,7 @@ if sys.platform != 'win32' or sys.version_info[:2] != (3, 13):
 site = ROOT / 'site'
 subprocess.run([sys.executable, '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check',
                 'install', '--no-input', '--no-cache-dir', '--no-deps', '--only-binary=:all:',
-                '--progress-bar', 'off', '--target', str(site), *WHEELS], check=True)
+                '--progress-bar', 'raw', '--target', str(site), *WHEELS], check=True)
 subprocess.run([sys.executable, '-I', '-c',
                 'import sys; sys.path.insert(0, sys.argv[1]); import torch, torchvision; '
                 'assert torch.version.cuda == "12.8"; '
