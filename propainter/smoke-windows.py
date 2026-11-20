@@ -1,19 +1,27 @@
 """Verify the shipped archive on Windows using a short masked RGB stream."""
+import argparse
 import hashlib
 from pathlib import Path
 import subprocess
-import sys
 import tarfile
 from tempfile import TemporaryDirectory
 
-archive = Path(sys.argv[1]).resolve()
+parser = argparse.ArgumentParser()
+parser.add_argument('archive', type=Path)
+parser.add_argument('--root', type=Path)
+parser.add_argument('--cuda', action='store_true')
+args = parser.parse_args()
+archive = args.archive.resolve()
 with archive.open('rb') as source:
     digest = hashlib.file_digest(source, 'sha256').hexdigest()
-assert digest == archive.with_name(archive.name + '.sha256').read_text().split()[0]
+if args.root is None:
+    assert digest == archive.with_name(archive.name + '.sha256').read_text().split()[0]
 with TemporaryDirectory(prefix='ProPainter relocated ') as temp:
-    with tarfile.open(archive, 'r:gz') as source:
-        source.extractall(temp, filter='data')
-    root = Path(temp, 'propainter-windows-x64')
+    root = args.root
+    if root is None:
+        with tarfile.open(archive, 'r:gz') as source:
+            source.extractall(temp, filter='data')
+        root = Path(temp, 'propainter-windows-x64')
     executable = root / 'python/python.exe'
     launch = subprocess.check_output([executable, '-I', '-B', root / 'launch.py', '--version'], cwd=temp, text=True)
     print(launch.strip())
@@ -25,8 +33,13 @@ with TemporaryDirectory(prefix='ProPainter relocated ') as temp:
     dirty = bytes(245 if mark[index // 3] else value for index, value in enumerate(frame))
     blank = bytes(width * height)
     records = frame + blank + dirty + mark + frame + blank
-    run = subprocess.run([executable, '-I', '-B', '-u', root / 'stream.py', '--stream', f'{width}x{height}'],
-                         input=records, stdout=subprocess.PIPE, timeout=240, cwd=temp, check=True)
+    stream = root / ('cuda/stream-cuda.py' if args.cuda else 'stream.py')
+    run = subprocess.run([executable, '-I', '-B', '-u', stream, '--stream', f'{width}x{height}'],
+                         input=records, capture_output=True, timeout=240, cwd=temp, check=True)
+    log = run.stderr.decode(errors='replace')
+    print(log)
+    if args.cuda:
+        assert 'ProPainter CUDA package running on ' in log and 'Retrying' not in log
     length = len(frame)
     assert len(run.stdout) == 3 * length
     assert run.stdout[:length] == run.stdout[2 * length:] == frame
