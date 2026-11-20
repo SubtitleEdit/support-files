@@ -110,7 +110,7 @@ See the manifest for pinned components and `licenses/` for notices.
     archive_path = output / PACKAGE
     with tarfile.open(archive_path, 'w:gz', compresslevel=3) as archive:
         archive.add(root, arcname=root.name)
-    (output / f'{PACKAGE}.sha256').write_text(f'{sha256(archive_path)}  {PACKAGE}\n', encoding='ascii')
+    (output / f'{PACKAGE}.sha256').write_bytes(f'{sha256(archive_path)}  {PACKAGE}\n'.encode('ascii'))
     print(f'Packaged {archive_path} ({archive_path.stat().st_size} bytes)')
 
 
