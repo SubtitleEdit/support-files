@@ -30,7 +30,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
 cmake --build build --config Release --target propainter-native
 ```
 
-CPU is the default backend. To try GPU graph execution, compile with `-DGGML_METAL=ON` or `-DGGML_CUDA=ON`, then set `PROPAINTER_BACKEND=metal` or `PROPAINTER_BACKEND=cuda`. Unsupported ggml graphs and operations such as flow warping still run on the CPU. The GPU route is experimental.
+macOS builds select Metal automatically when it is available. The Windows CUDA package likewise
+selects CUDA automatically. Both builds fall back to ggml CPU if the GPU backend is unavailable.
+Operations such as flow warping run on CPU. Set `PROPAINTER_BACKEND=cpu` to force CPU inference,
+or set it to `metal` or `cuda` to require that backend for a test. Set `-DGGML_METAL=OFF` when
+configuring CMake to build a CPU-only macOS executable.
 
 ## Models and verification
 
