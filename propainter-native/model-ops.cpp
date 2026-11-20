@@ -19,14 +19,23 @@ ggml_backend_t accelerator() {
     static auto device = [] {
         using Backend = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
         const char * requested = std::getenv("PROPAINTER_BACKEND");
-        if (!requested || std::string_view(requested) == "cpu")
-            return Backend(nullptr, &ggml_backend_free);
-        const std::string_view name(requested);
+#ifdef PROPAINTER_AUTO_CUDA
+        const std::string_view default_backend = "cuda";
+#else
+        const std::string_view default_backend = "cpu";
+#endif
+        const std::string_view name = requested ? std::string_view(requested) : default_backend;
+        if (name == "cpu") return Backend(nullptr, &ggml_backend_free);
         if (name != "metal" && name != "cuda")
             throw std::runtime_error("PROPAINTER_BACKEND must be cpu, metal, or cuda");
         const auto dev = ggml_backend_dev_by_name(name == "metal" ? "MTL0" : "CUDA0");
         Backend backend(dev ? ggml_backend_dev_init(dev, nullptr) : nullptr, &ggml_backend_free);
-        if (!backend) throw std::runtime_error("Requested ggml backend is unavailable: " + std::string(name));
+        if (!backend) {
+            if (requested)
+                throw std::runtime_error("Requested ggml backend is unavailable: " + std::string(name));
+            std::cerr << "ProPainter ggml CUDA unavailable, using CPU\n";
+            return backend;
+        }
         std::cerr << "ProPainter ggml backend: " << ggml_backend_name(backend.get()) << '\n';
         return backend;
     }();

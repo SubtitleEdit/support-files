@@ -37,3 +37,15 @@ CPU is the default backend. To try GPU graph execution, compile with `-DGGML_MET
 The three GGUF files are lossless conversions of the official v0.1.0 [ProPainter checkpoints](https://github.com/sczhou/ProPainter/releases/tag/v0.1.0). They are covered by the included S-Lab License 1.0, which permits non-commercial redistribution and use. The optional `convert-checkpoints.py` developer tool needs PyTorch and `gguf==0.19.0` if you want to reproduce the conversion from the upstream checkpoint files. The reference checks likewise use PyTorch only during development.
 
 The full native CPU renderer matched PyTorch exactly on five real 96×56 frames and within one 8-bit RGB level on eight 464×168 frames. The reference checks compare the entire output, including unmasked pixels.
+
+### Windows CUDA package
+
+The Windows CUDA build bundles the CUDA runtime and cuBLAS libraries. It selects an NVIDIA
+GPU automatically when available and falls back to ggml CPU when it cannot initialize one.
+Use the same RGB24/mask8 stream interface as the CPU build. GPU acceleration requires a
+CUDA 12.8-compatible NVIDIA driver and a GPU with compute capability 7.5 or later.
+
+Set the PowerShell environment variable PROPAINTER_BACKEND to 'cuda' to require CUDA for a
+test run, or to 'cpu' to force CPU inference. The renderer logs the selected device to stderr.
+To run the stream smoke test on an NVIDIA machine, set the variable to 'cuda' before running
+smoke.ps1 from this source tree.

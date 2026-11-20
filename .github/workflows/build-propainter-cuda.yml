@@ -1,0 +1,80 @@
+name: Build native ProPainter CUDA
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - propainter-native/**
+      - .github/workflows/build-propainter-cuda.yml
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 50
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: CrispStrobe/ggml
+          ref: 3a27b6c665b191cb230be367db5c52d81dd3e2ac
+          path: ggml
+          persist-credentials: false
+      - name: Fetch pinned CUDA 12.8 toolkit components
+        shell: pwsh
+        run: ./propainter-native/install-cuda-toolkit.ps1 -Destination "$env:RUNNER_TEMP/cuda-toolkit"
+      - name: Build C++ and ggml CUDA
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ([Environment]::GetEnvironmentVariable('ProgramFiles(x86)')) 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          & (Join-Path $vs 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          $cuda = Join-Path $env:RUNNER_TEMP 'cuda-toolkit'
+          $env:PATH = "$cuda/bin;$env:PATH"
+          $options = @(
+            "-DGGML_SOURCE=$PWD/ggml", "-DCUDAToolkit_ROOT=$cuda", "-DCMAKE_CUDA_COMPILER=$cuda/bin/nvcc.exe",
+            '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_SHARED_LIBS=OFF', '-DGGML_NATIVE=OFF', '-DGGML_OPENMP=OFF',
+            '-DGGML_CUDA=ON', '-DGGML_CUDA_NO_VMM=ON', '-DGGML_CUDA_GRAPHS=OFF', '-DGGML_CUDA_FA=OFF',
+            '-DCMAKE_CUDA_ARCHITECTURES=75', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
+          )
+          cmake -S propainter-native -B build-cuda -G Ninja @options
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-cuda --target propainter-native --parallel 4
+      - name: Package and smoke-test on the Windows runner
+        shell: pwsh
+        run: |
+          $cuda = Join-Path $env:RUNNER_TEMP 'cuda-toolkit'
+          $package = 'propainter-native-windows-x64-cuda'
+          $archive = 'propainter-native-0.3.0-windows-x64-cuda.tar.gz'
+          New-Item -ItemType Directory -Path $package | Out-Null
+          $cpuArchive = 'propainter-native-0.3.0-windows-x64.tar.gz'
+          gh release download propainter-native-0.3.0 --repo SubtitleEdit/support-files --pattern $cpuArchive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-FileHash -Algorithm SHA256 $cpuArchive).Hash -ne 'a0d98f69636a1a71791b6c51a77dbb9c2d539a0801ffd37d9946b519f3654748') {
+            throw 'Model archive checksum mismatch.'
+          }
+          tar.exe -xzf $cpuArchive propainter-native-windows-x64/models
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Move-Item propainter-native-windows-x64/models $package
+          Copy-Item build-cuda/propainter-native.exe,propainter-native/README.md,propainter-native/LICENSE-*.txt $package
+          foreach ($name in 'cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll') {
+            Copy-Item (Join-Path "$cuda/bin" $name) $package
+          }
+          Copy-Item "$cuda/licenses/*.txt" $package
+          ./propainter-native/smoke.ps1 -Executable (Join-Path $PWD "$package/propainter-native.exe")
+          tar.exe -czf $archive $package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $PWD "$archive.sha256"), "$hash  $archive" + [char]10)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: propainter-native-windows-x64-cuda
+          path: |
+            propainter-native-0.3.0-windows-x64-cuda.tar.gz
+            propainter-native-0.3.0-windows-x64-cuda.tar.gz.sha256
+          compression-level: 0
+          if-no-files-found: error
