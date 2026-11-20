@@ -34,3 +34,7 @@ add_library(propainter-generator STATIC generator.cpp sparse-transformer.cpp)
 target_link_libraries(propainter-generator PUBLIC propainter-model-ops)
 add_executable(propainter-native propainter-cli.cpp renderer.cpp stream.cpp)
 target_link_libraries(propainter-native PRIVATE propainter-raft-core propainter-flow-completion propainter-generator)
+
+if(WIN32 AND GGML_CUDA)
+    target_compile_definitions(propainter-model-ops PRIVATE PROPAINTER_AUTO_CUDA)
+endif()
