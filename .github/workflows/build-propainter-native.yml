@@ -2,11 +2,6 @@ name: Build native ProPainter
 
 on:
   workflow_dispatch:
-  push:
-    branches: [feat/propainter-native]
-    paths:
-      - propainter-native/**
-      - .github/workflows/build-propainter-native.yml
   pull_request:
     paths:
       - propainter-native/**
@@ -42,20 +37,25 @@ jobs:
           New-Item -ItemType Directory -Path $package | Out-Null
           gh release download propainter-native-0.3.0 --repo SubtitleEdit/support-files --pattern propainter-native-macos-arm64.tar.gz
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $modelsHash = (Get-FileHash -Algorithm SHA256 propainter-native-macos-arm64.tar.gz).Hash
+          if ($modelsHash -ne "fc9700f215d0004b355181d7e3e58e724e522e34e09c8eb29a5c302615e2eda2") {
+            throw "Model archive checksum mismatch."
+          }
           tar -xzf propainter-native-macos-arm64.tar.gz propainter-native-macos-arm64/models
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Move-Item propainter-native-macos-arm64/models $package
           Copy-Item build/Release/propainter-native.exe,propainter-native/README.md,propainter-native/LICENSE-*.txt $package
           ./propainter-native/smoke.ps1 -Executable (Join-Path $PWD "$package/propainter-native.exe")
-          tar -czf "$package.tar.gz" $package
+          $archive = "propainter-native-0.3.0-windows-x64.tar.gz"
+          tar -czf $archive $package
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $hash = (Get-FileHash -Algorithm SHA256 "$package.tar.gz").Hash.ToLowerInvariant()
-          "$hash  $package.tar.gz" | Set-Content -Encoding ascii "$package.tar.gz.sha256"
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Encoding ascii "$archive.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: propainter-native-windows-x64
           path: |
-            propainter-native-windows-x64.tar.gz
-            propainter-native-windows-x64.tar.gz.sha256
+            propainter-native-0.3.0-windows-x64.tar.gz
+            propainter-native-0.3.0-windows-x64.tar.gz.sha256
           compression-level: 0
           if-no-files-found: error

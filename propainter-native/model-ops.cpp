@@ -24,7 +24,7 @@ ggml_backend_t accelerator() {
         const std::string_view name(requested);
         if (name != "metal" && name != "cuda")
             throw std::runtime_error("PROPAINTER_BACKEND must be cpu, metal, or cuda");
-        const auto dev = ggml_backend_dev_by_name(name == "metal" ? "Metal" : "CUDA0");
+        const auto dev = ggml_backend_dev_by_name(name == "metal" ? "MTL0" : "CUDA0");
         Backend backend(dev ? ggml_backend_dev_init(dev, nullptr) : nullptr, &ggml_backend_free);
         if (!backend) throw std::runtime_error("Requested ggml backend is unavailable: " + std::string(name));
         std::cerr << "ProPainter ggml backend: " << ggml_backend_name(backend.get()) << '\n';

@@ -20,8 +20,8 @@ try {
     $stream = [IO.File]::Create((Join-Path $dir.FullName "stream.bin"))
     try {
         for ($i = 0; $i -lt 2; $i++) {
-            $stream.Write($rgb)
-            $stream.Write($mask)
+            $stream.Write($rgb, 0, $rgb.Length)
+            $stream.Write($mask, 0, $mask.Length)
         }
     } finally {
         $stream.Dispose()
