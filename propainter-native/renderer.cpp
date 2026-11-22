@@ -78,9 +78,11 @@ void append_crop(Sequence & target, Sequence & source, int start, int end) {
 std::vector<std::vector<uint8_t>> render(const std::filesystem::path & models, const Sequence & images,
                                          const Sequence & masks, std::vector<std::vector<uint8_t>> pixels,
                                          int iterations, int neighbor_stride, int ref_stride, int subvideo) {
-    if (std::none_of(masks.begin(), masks.end(), [](const FeatureMap & mask) {
-        return std::any_of(mask.data.begin(), mask.data.end(), [](float value) { return value != 0; });
-    })) return pixels;
+    std::vector<bool> has_mask;
+    has_mask.reserve(masks.size());
+    for (const auto & mask : masks)
+        has_mask.push_back(std::any_of(mask.data.begin(), mask.data.end(), [](float value) { return value != 0; }));
+    if (std::none_of(has_mask.begin(), has_mask.end(), [](bool value) { return value; })) return pixels;
     const int frames = images.size();
     const int links = frames - 1;
     BidirectionalFlow flows;
@@ -127,10 +129,29 @@ std::vector<std::vector<uint8_t>> render(const std::filesystem::path & models, c
     }
     auto generator = load_model(models / "ProPainter.gguf", "propainter-generator");
     std::vector<bool> processed(frames);
+    // Frame encodings are independent of the window and can be shared by local and reference frames.
+    Sequence encoded(frames);
+    size_t cache_remaining = 128 * 1024 * 1024 / sizeof(float);
+    const auto get_encoding = [&](int t) {
+        if (!encoded[t].data.empty())
+            return encoded[t];
+
+        auto feature = encode_image(generator.get(), propagated.images[t], masks[t], propagated.masks[t]);
+        if (feature.data.size() <= cache_remaining) {
+            cache_remaining -= feature.data.size();
+            encoded[t] = feature;
+        }
+
+        return feature;
+    };
     for (int center = 0; center < frames; center += neighbor_stride) {
         const int start = std::max(0, center - neighbor_stride);
         const int end = std::min(frames, center + neighbor_stride + 1);
-        auto local_images = subset(propagated.images, start, end);
+        if (std::none_of(has_mask.begin() + start, has_mask.begin() + end, [](bool value) { return value; }))
+            continue;
+        Sequence local_features;
+        for (int index = start; index < end; ++index)
+            local_features.push_back(get_encoding(index));
         auto local_masks = subset(masks, start, end);
         auto local_updated = subset(propagated.masks, start, end);
         const int radius = ref_stride * (subvideo / ref_stride / 2);
@@ -138,13 +159,14 @@ std::vector<std::vector<uint8_t>> render(const std::filesystem::path & models, c
         const int ref_end = frames > subvideo ? std::min(frames, center + radius) : frames;
         for (int index = ref_start; index < ref_end; index += ref_stride) {
             if (index >= start && index < end) continue;
-            local_images.push_back(propagated.images[index]);
+            local_features.push_back(get_encoding(index));
             local_masks.push_back(masks[index]);
             local_updated.push_back(propagated.masks[index]);
         }
-        const auto patch = inpaint(generator.get(), local_images, subset(flows, start, end - 1),
+        const auto patch = inpaint(generator.get(), std::move(local_features), subset(flows, start, end - 1),
                                    local_masks, local_updated, end - start);
         for (int t = start; t < end; ++t) {
+            if (!has_mask[t]) continue;
             const auto & frame = patch[t - start];
             for (size_t p = 0; p < frame.pixels(); ++p) {
                 if (masks[t].data[p] == 0) continue;
