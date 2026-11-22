@@ -185,12 +185,12 @@ FeatureMap resize_canvas(const FeatureMap & input, int width, int height) {
     return output;
 }
 
-FeatureMap estimate_flow(ggml_context * model, const FeatureMap & first, const FeatureMap & second, int iterations) {
-    const auto first_features = encode(model, first, false);
-    const auto second_features = encode(model, second, false);
+FeatureMap estimate_flow(ggml_context * model, const RaftFrame & first, const RaftFrame & second, int iterations) {
+    const auto & first_features = first.features;
+    const auto & second_features = second.features;
+    const auto & context = first.context;
     const int width = first_features.width, height = first_features.height;
     const RaftCorrelation correlation(first_features.data, second_features.data, first_features.channels, height, width);
-    const auto context = encode(model, first, true);
     auto hidden = slice(context, 0, 128);
     auto input = slice(context, 128, 128);
     for (auto & value : hidden.data) {
@@ -233,13 +233,19 @@ FeatureMap estimate_flow(ggml_context * model, const FeatureMap & first, const F
 }
 
 namespace propainter {
+RaftFrame raft_prepare(ggml_context * model, const FeatureMap & image) {
+    const int padded_width = std::max(128, ((image.width + 7) / 8) * 8);
+    const int padded_height = std::max(128, ((image.height + 7) / 8) * 8);
+    const auto padded = resize_canvas(image, padded_width, padded_height);
+    return {encode(model, padded, false), encode(model, padded, true), image.width, image.height};
+}
+
+FeatureMap raft_flow(ggml_context * model, const RaftFrame & first, const RaftFrame & second, int iterations) {
+    return resize_canvas(estimate_flow(model, first, second, iterations), first.width, first.height);
+}
+
 FeatureMap raft_flow(ggml_context * model, const FeatureMap & first, const FeatureMap & second, int iterations) {
-    const int width = first.width, height = first.height;
-    const int padded_width = std::max(128, ((width + 7) / 8) * 8);
-    const int padded_height = std::max(128, ((height + 7) / 8) * 8);
-    return resize_canvas(estimate_flow(model,
-        resize_canvas(first, padded_width, padded_height),
-        resize_canvas(second, padded_width, padded_height), iterations), width, height);
+    return raft_flow(model, raft_prepare(model, first), raft_prepare(model, second), iterations);
 }
 
 FeatureMap raft_encode(ggml_context * model, const FeatureMap & image, bool context) {

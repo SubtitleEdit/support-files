@@ -87,9 +87,12 @@ std::vector<std::vector<uint8_t>> render(const std::filesystem::path & models, c
     if (links > 0) {
         {
             auto raft = load_model(models / "raft-things.gguf", "propainter-raft");
+            auto first = raft_prepare(raft.get(), images.front());
             for (int i = 0; i < links; ++i) {
-                flows.forward.push_back(raft_flow(raft.get(), images[i], images[i + 1], iterations));
-                flows.backward.push_back(raft_flow(raft.get(), images[i + 1], images[i], iterations));
+                auto second = raft_prepare(raft.get(), images[i + 1]);
+                flows.forward.push_back(raft_flow(raft.get(), first, second, iterations));
+                flows.backward.push_back(raft_flow(raft.get(), second, first, iterations));
+                first = std::move(second);
                 std::cerr << "RAFT " << i + 1 << '/' << links << '\n';
             }
         }
