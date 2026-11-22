@@ -152,19 +152,21 @@ PropagatedImages propagate_images(const Sequence & images, const BidirectionalFl
     return propagate(nullptr, images, flows, masks);
 }
 
-Sequence inpaint(ggml_context * model, const Sequence & images, const BidirectionalFlow & flows,
+FeatureMap encode_image(ggml_context * model, const FeatureMap & image, const FeatureMap & mask,
+                        const FeatureMap & updated) {
+    return encode(model, concatenate(concatenate(image, mask), updated));
+}
+
+Sequence inpaint(ggml_context * model, Sequence features, const BidirectionalFlow & flows,
                  const Sequence & masks, const Sequence & updated, size_t local_frames) {
-    if (!model || local_frames < 1 || local_frames > images.size() || masks.size() != images.size() ||
-        updated.size() != images.size() || flows.forward.size() + 1 != local_frames ||
+    if (!model || local_frames < 1 || local_frames > features.size() || masks.size() != features.size() ||
+        updated.size() != features.size() || flows.forward.size() + 1 != local_frames ||
         flows.backward.size() != flows.forward.size())
         throw std::runtime_error("Invalid inpainting sequence");
-    Sequence features, local_masks, feature_masks;
-    for (size_t t = 0; t < images.size(); ++t) {
-        features.push_back(encode(model, concatenate(concatenate(images[t], masks[t]), updated[t])));
-        if (t < local_frames) {
-            local_masks.push_back(quarter(masks[t], false));
-            feature_masks.push_back(concatenate(local_masks.back(), quarter(updated[t], false)));
-        }
+    Sequence local_masks, feature_masks;
+    for (size_t t = 0; t < local_frames; ++t) {
+        local_masks.push_back(quarter(masks[t], false));
+        feature_masks.push_back(concatenate(local_masks.back(), quarter(updated[t], false)));
     }
     BidirectionalFlow scaled;
     for (size_t t = 0; t + 1 < local_frames; ++t) {
@@ -177,7 +179,13 @@ Sequence inpaint(ggml_context * model, const Sequence & images, const Bidirectio
 
     transform_features(model, features, local_masks);
     features.resize(local_frames);
-    for (auto & frame : features) {
+    for (size_t t = 0; t < local_frames; ++t) {
+        auto & frame = features[t];
+        if (std::none_of(masks[t].data.begin(), masks[t].data.end(), [](float value) { return value != 0; })) {
+            frame = {};
+            continue;
+        }
+
         for (int layer : {0, 2, 4, 6}) {
             const bool upscale = layer == 0 || layer == 4;
             frame = convolution(model, "decoder." + std::to_string(layer) + (upscale ? ".conv" : ""),
