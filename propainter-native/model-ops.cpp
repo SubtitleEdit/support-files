@@ -61,8 +61,21 @@ void execute(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor *
             backend = cpu.get();
         }
         std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
-            ggml_backend_alloc_ctx_tensors(ctx, backend), &ggml_backend_buffer_free);
-        if (!buffer) throw std::runtime_error("Cannot allocate ggml backend tensor buffer");
+            nullptr, &ggml_backend_buffer_free);
+        if (std::string_view(ggml_backend_name(backend)) == "MTL0") {
+            // Calls are sequential and synchronized before returning results to the host.
+            // Keep the Metal arena across graphs instead of allocating a buffer per operation.
+            static std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> arena(
+                ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)), &ggml_gallocr_free);
+            ggml_set_input(x);
+            ggml_set_input(w);
+            ggml_set_output(y);
+            if (!arena || !ggml_gallocr_alloc_graph(arena.get(), graph))
+                throw std::runtime_error("Cannot allocate the Metal graph");
+        } else {
+            buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend));
+            if (!buffer) throw std::runtime_error("Cannot allocate ggml backend tensor buffer");
+        }
         ggml_backend_tensor_set(x, input, 0, ggml_nbytes(x));
         ggml_backend_tensor_set(w, weights, 0, ggml_nbytes(w));
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
