@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <initializer_list>
+#include <utility>
 #include <string_view>
 #include <memory>
 #include <stdexcept>
@@ -44,8 +46,14 @@ ggml_backend_t accelerator() {
     return device.get();
 }
 
-void execute(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * y,
-             const float * input, const float * weights, float * result, ggml_backend_t backend) {
+bool is_metal(ggml_backend_t backend) {
+    return backend && std::string_view(ggml_backend_name(backend)) == "MTL0";
+}
+
+using GraphInput = std::pair<ggml_tensor *, const float *>;
+
+void execute(ggml_context * ctx, std::initializer_list<GraphInput> inputs, ggml_tensor * y,
+             float * result, ggml_backend_t backend) {
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, y);
     if (backend) {
@@ -62,13 +70,13 @@ void execute(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor *
         }
         std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
             nullptr, &ggml_backend_buffer_free);
-        if (std::string_view(ggml_backend_name(backend)) == "MTL0") {
+        if (is_metal(backend)) {
             // Calls are sequential and synchronized before returning results to the host.
             // Keep the Metal arena across graphs instead of allocating a buffer per operation.
             static std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> arena(
                 ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)), &ggml_gallocr_free);
-            ggml_set_input(x);
-            ggml_set_input(w);
+            for (const auto & input : inputs)
+                ggml_set_input(input.first);
             ggml_set_output(y);
             if (!arena || !ggml_gallocr_alloc_graph(arena.get(), graph))
                 throw std::runtime_error("Cannot allocate the Metal graph");
@@ -76,15 +84,15 @@ void execute(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor *
             buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend));
             if (!buffer) throw std::runtime_error("Cannot allocate ggml backend tensor buffer");
         }
-        ggml_backend_tensor_set(x, input, 0, ggml_nbytes(x));
-        ggml_backend_tensor_set(w, weights, 0, ggml_nbytes(w));
+        for (const auto & [tensor, data] : inputs)
+            ggml_backend_tensor_set(tensor, data, 0, ggml_nbytes(tensor));
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("ggml backend graph computation failed");
         ggml_backend_tensor_get(y, result, 0, ggml_nbytes(y));
         return;
     }
-    std::memcpy(x->data, input, ggml_nbytes(x));
-    std::memcpy(w->data, weights, ggml_nbytes(w));
+    for (const auto & [tensor, data] : inputs)
+        std::memcpy(tensor->data, data, ggml_nbytes(tensor));
     if (ggml_graph_compute_with_ctx(ctx, graph, 4) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("ggml CPU graph computation failed");
     std::memcpy(result, y->data, ggml_nbytes(y));
@@ -144,8 +152,9 @@ FeatureMap convolution(ggml_context * model, const std::string & prefix, const F
         auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, source.width, source.height, input_channels);
         auto * kernel = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, kernel_w, kernel_h, input_channels, output_channels);
         auto * y = ggml_conv_2d(ctx.get(), kernel, x, stride, stride, padding, padding_y, dilation, dilation);
-        execute(ctx.get(), x, kernel, y, source.data.data() + group * input_size,
-                static_cast<const float *>(weight.data) + group * kernel_size, computed.data(), backend);
+        execute(ctx.get(), {{x, source.data.data() + group * input_size},
+                            {kernel, static_cast<const float *>(weight.data) + group * kernel_size}},
+                y, computed.data(), backend);
         for (int c = 0; c < output_channels; ++c) {
             const int channel = group * output_channels + c;
             for (size_t i = 0; i < cells; ++i)
@@ -208,7 +217,26 @@ void multiply(const float * weight, const float * columns, float * output, int i
     auto * w = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, inner, channels);
     auto * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, inner, cells);
     auto * y = ggml_mul_mat(ctx.get(), w, x);
-    execute(ctx.get(), x, w, y, columns, weight, output, backend);
+    execute(ctx.get(), {{x, columns}, {w, weight}}, y, output, backend);
+}
+
+bool metal_attention(const float * query, const float * key, const float * value, float * result,
+                     int width, int queries, int keys) {
+    auto * backend = accelerator();
+    if (!is_metal(backend)) return false;
+
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+        ggml_init({1024 * 1024, nullptr, true}), &ggml_free);
+    if (!ctx) throw std::runtime_error("Cannot allocate the attention graph");
+    auto * q = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, queries);
+    auto * k = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, keys);
+    auto * v = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, keys, width);
+    auto * scores = ggml_mul_mat(ctx.get(), k, q);
+    const float scale = 1 / std::sqrt(float(width));
+    auto * probabilities = ggml_soft_max_ext(ctx.get(), scores, nullptr, scale, 0.0f);
+    auto * output = ggml_mul_mat(ctx.get(), v, probabilities);
+    execute(ctx.get(), {{q, query}, {k, key}, {v, value}}, output, result, backend);
+    return true;
 }
 
 FeatureMap deform(ggml_context * model, const std::string & prefix, const FeatureMap & input,
