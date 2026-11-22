@@ -132,7 +132,7 @@ void attend_head(const std::vector<int> & queries, const std::vector<int> & keys
                  std::vector<float> & output) {
     const int nq = queries.size(), nk = keys.size();
     std::vector<float> qq(size_t(nq) * head_width), kk(size_t(nk) * head_width);
-    std::vector<float> vv(size_t(nk) * head_width), scores(size_t(nq) * nk), result(size_t(nq) * head_width);
+    std::vector<float> vv(size_t(nk) * head_width), result(size_t(nq) * head_width);
     for (int i = 0; i < nq; ++i)
         std::copy_n(q.data() + queries[i] * hidden + offset, head_width, qq.data() + i * head_width);
     for (int i = 0; i < nk; ++i) {
@@ -140,19 +140,22 @@ void attend_head(const std::vector<int> & queries, const std::vector<int> & keys
         for (int c = 0; c < head_width; ++c)
             vv[c * nk + i] = v[keys[i] * hidden + offset + c];
     }
-    multiply(kk.data(), qq.data(), scores.data(), head_width, nq, nk);
-    const float scale = 1 / std::sqrt(float(head_width));
-    for (int i = 0; i < nq; ++i) {
-        auto * row = scores.data() + i * nk;
-        const float max = *std::max_element(row, row + nk);
-        float sum = 0;
-        for (int j = 0; j < nk; ++j) {
-            row[j] = std::exp((row[j] - max) * scale);
-            sum += row[j];
+    if (!metal_attention(qq.data(), kk.data(), vv.data(), result.data(), head_width, nq, nk)) {
+        std::vector<float> scores(size_t(nq) * nk);
+        multiply(kk.data(), qq.data(), scores.data(), head_width, nq, nk);
+        const float scale = 1 / std::sqrt(float(head_width));
+        for (int i = 0; i < nq; ++i) {
+            auto * row = scores.data() + i * nk;
+            const float max = *std::max_element(row, row + nk);
+            float sum = 0;
+            for (int j = 0; j < nk; ++j) {
+                row[j] = std::exp((row[j] - max) * scale);
+                sum += row[j];
+            }
+            for (int j = 0; j < nk; ++j) row[j] /= sum;
         }
-        for (int j = 0; j < nk; ++j) row[j] /= sum;
+        multiply(vv.data(), scores.data(), result.data(), nk, nq, head_width);
     }
-    multiply(vv.data(), scores.data(), result.data(), nk, nq, head_width);
     for (int i = 0; i < nq; ++i)
         std::copy_n(result.data() + i * head_width, head_width, output.data() + queries[i] * hidden + offset);
 }

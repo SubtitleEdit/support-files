@@ -27,5 +27,7 @@ float sample(const float * plane, int width, int height, float x, float y);
 FeatureMap resize_twice(const FeatureMap & input);
 FeatureMap deform(ggml_context * model, const std::string & prefix, const FeatureMap & input,
                   const FeatureMap & condition, float magnitude, const FeatureMap * flow = nullptr);
+bool metal_attention(const float * query, const float * key, const float * value, float * result,
+                     int width, int queries, int keys);
 void multiply(const float * weight, const float * columns, float * output, int inner, int cells, int channels);
 }
