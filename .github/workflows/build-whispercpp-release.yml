@@ -190,7 +190,10 @@ jobs:
   # --------------------------------------------------------------------
   linux-vulkan:
     needs: fetch-silero
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, where the LunarG noble repo's
+    # vulkan-sdk 1.4.313 conflicts with the stock libvulkan-dev 1.4.341, and
+    # building there would also raise the glibc floor for SE's Linux users.
+    runs-on: ubuntu-24.04
     steps:
       - name: Clone whisper.cpp
         uses: actions/checkout@v5
