@@ -144,11 +144,21 @@ jobs:
           Get-ChildItem -Recurse "$env:GITHUB_WORKSPACE/spirv-install" -Filter '*.cmake' | Select-Object FullName
 
       - name: Configure
+        # GGML_NATIVE defaults to ON, which compiles ggml-cpu.dll for the
+        # runner's CPU. GitHub's Windows runners have AVX-512, so whispercpp-196
+        # shipped a ggml-cpu.dll that dies with 0xC000001D (illegal instruction)
+        # on AVX2-only CPUs like Comet Lake (SubtitleEdit issue #17252). Build
+        # the per-microarch ggml-cpu-*.dll variants instead and let ggml pick
+        # one at runtime, same as the Linux job and upstream's BLAS zip.
+        # GGML_CPU_ALL_VARIANTS requires GGML_BACKEND_DL.
         shell: pwsh
         run: |
           cmake -B build -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
             -DGGML_VULKAN=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
             -DWHISPER_SDL2=OFF `
             -DBUILD_SHARED_LIBS=ON `
             -DCMAKE_PREFIX_PATH="$env:VULKAN_SDK;$env:GITHUB_WORKSPACE/spirv-install"
@@ -167,6 +177,18 @@ jobs:
           } | Where-Object {
             $_.Name -notin 'bench.exe','main.exe','quantize.exe','server.exe','stream.exe','command.exe','lsp.exe','talk-llama.exe'
           } | Copy-Item -Destination staging
+
+      - name: Verify CPU backend variants
+        # Regression guard for #17252: a lone native-tuned ggml-cpu.dll must
+        # never ship again. Require the baseline and AVX2 variants and the
+        # dynamically loaded Vulkan backend.
+        shell: pwsh
+        run: |
+          Get-ChildItem staging | Select-Object Name, Length
+          if (Test-Path staging/ggml-cpu.dll) { throw "staging has a single native ggml-cpu.dll - expected ggml-cpu-*.dll variants" }
+          foreach ($dll in 'whisper-cli.exe','ggml-cpu-x64.dll','ggml-cpu-sse42.dll','ggml-cpu-haswell.dll','ggml-vulkan.dll') {
+            if (-not (Test-Path "staging/$dll")) { throw "missing $dll" }
+          }
 
       - uses: actions/download-artifact@v4
         with: { name: silero, path: staging }
